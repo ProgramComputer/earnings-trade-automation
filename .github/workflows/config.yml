@@ -14,6 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
+      ALPACA_PAPER: ${{ vars.ALPACA_PAPER }}
       APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
       APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
       GOOGLE_SCRIPT_URL: ${{ secrets.GOOGLE_SCRIPT_URL }}
@@ -80,4 +81,4 @@ jobs:
           else
             git commit -m "chore: update trades.db"
             git push
-          fi 
+          fi
