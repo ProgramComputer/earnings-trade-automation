@@ -118,23 +118,6 @@ jobs:
           esac
           echo "Validated workflow mode: ${RUN_MODE}."
 
-      - name: Validate synchronization secrets
-        if: steps.market.outputs.run_mode == 'paper-trade'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${GOOGLE_SCRIPT_URL}" || -z "${GOOGLE_SCRIPT_SECRET}" ]]; then
-            echo "::error::Google Sheet synchronization URL or authentication secret is not configured."
-            exit 78
-          fi
-          case "${GOOGLE_SCRIPT_URL}" in
-            https://script.google.com/macros/s/*/exec) ;;
-            *)
-              echo "::error::GOOGLE_SCRIPT_URL is not a valid Apps Script web deployment URL."
-              exit 78
-              ;;
-          esac
-
       - name: Set up Python 3.10
         if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only'
         uses: actions/setup-python@v5
@@ -172,6 +155,12 @@ jobs:
             echo "safety_failure=false" >> "${GITHUB_OUTPUT}"
           fi
           exit "${workflow_status}"
+
+      - name: Sync optional Sheet outbox
+        if: always() && steps.market.outputs.run_mode == 'paper-trade'
+        continue-on-error: true
+        shell: bash
+        run: python trade_workflow.py --sync-sheet
 
       - name: Commit durable ledger updates
         id: persist

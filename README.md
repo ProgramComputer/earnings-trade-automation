@@ -5,7 +5,7 @@ Automated trading bot for executing earnings calendar spread strategies using op
 ## Features
 - **Automated Earnings Calendar Spread Trading**: Opens and closes calendar spreads around earnings events based on strict screening criteria.
 - **Kelly Criterion Position Sizing**: Uses a 10% Kelly fraction for optimal, risk-managed position sizing.
-- **Google Sheets Integration**: Tracks trades and workflow status in a Google Sheet via Apps Script.
+- **Optional Google Sheets Integration**: Queues trade updates in SQLite and syncs them separately through Apps Script.
 - **Alpaca API Integration**: Places and closes trades automatically using Alpaca brokerage API.
 - **Configurable and Extensible**: Modular codebase for easy strategy tweaks and integration.
 
@@ -29,15 +29,14 @@ cd earnings-calendar-spread-bot
 ```
 
 ### 2. Google Sheets Set Up (Optional)
-Create a copy of https://docs.google.com/spreadsheets/d/1qOu4PJtcpYwLZgFFIpVr8FXD12dXoWZaKxSeg9FR7lU/ and add code.gs to App Script
+Sheet synchronization is optional. Without `GOOGLE_SCRIPT_URL` and `GOOGLE_SCRIPT_SECRET`, fill events remain queued in SQLite and the workflow continues. When configured, a separate best-effort step delivers queued events through the connected Sheet's Apps Script deployment; a Sheet failure does not block reconciliation, position management, or new PAPER orders.
 
-#### Apps Script Request Authentication
-Generate one long random secret and store the same value in both places:
+To authenticate requests, generate one long random secret and store the same value in both places:
 
 - In Apps Script, open **Project Settings > Script Properties** and add `GOOGLE_SCRIPT_SECRET`.
 - In GitHub, open **Settings > Secrets and variables > Actions** and add `GOOGLE_SCRIPT_SECRET`.
 
-Never commit this secret, place it in Sheet cells, or print it in logs.
+Never commit this secret, place it in Sheet cells, or print it in logs. The Apps Script source uses `@OnlyCurrentDoc` so its spreadsheet access is limited to the connected Sheet.
 
 ### 3. Set Up Environment Variables
 Create a `.env` file in the root directory with your credentials:
@@ -82,7 +81,7 @@ The included GitHub Actions workflow is explicitly configured for PAPER trading.
 - **Screen for Earnings**: Bot fetches tomorrow's earnings tickers.
 - **Screening & Sizing**: For each ticker, applies IV/volume/slope criteria and calculates position size using Kelly.
 - **Open Trades**: Places calendar spread trades at the correct time (BMO/AMC logic).
-- **Track & Close**: Monitors open trades and closes them at the correct time, updating Google Sheets.
+- **Track & Close**: Monitors open trades and closes them at the correct time, with optional Sheet updates delivered from the SQLite outbox.
 
 
 

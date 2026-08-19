@@ -741,6 +741,11 @@ def record_fill(trade_id, phase, method, order, close_reason=None):
 
 
 def sync_sheet_outbox(*, deadline=None, max_events=5):
+    if not GOOGLE_SCRIPT_URL or not GOOGLE_SCRIPT_SECRET:
+        print("Google Sheet synchronization is not configured; queued events remain in SQLite.")
+        return True
+    if not re.fullmatch(r"https://script\.google\.com/macros/s/[^/]+/exec", GOOGLE_SCRIPT_URL):
+        raise OperationalFailure("GOOGLE_SCRIPT_URL is not a valid Apps Script web deployment URL")
     with db() as conn:
         events=conn.execute('''SELECT sheet_outbox.*,fills.realized_pnl_cents AS outbox_realized_pnl_cents,
           CASE WHEN fills.commission_status='unavailable' OR EXISTS(
@@ -749,14 +754,11 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
           ) THEN 'unavailable' ELSE fills.commission_status END AS outbox_commission_status
           FROM sheet_outbox JOIN fills
           ON fills.fill_id=sheet_outbox.fill_id WHERE sheet_outbox.state!='synced'
-          AND sheet_outbox.attempts<10 ORDER BY sheet_outbox.created_at''').fetchall()
-        exhausted=conn.execute("SELECT event_id,last_error FROM sheet_outbox WHERE state!='synced' AND attempts>=10 ORDER BY created_at").fetchall()
+          ORDER BY sheet_outbox.created_at''').fetchall()
         identity=conn.execute("SELECT broker_mode,account_fingerprint FROM broker_identity WHERE singleton_id=1").fetchone()
-    if (events or exhausted) and not identity:
+    if events and not identity:
         raise OperationalFailure("Cannot sync Sheet events from an unbound broker ledger")
-    failures=[f"{row['event_id']}: retry limit exhausted ({redact(row['last_error'] or 'unknown error')})" for row in exhausted]
-    if events and (not GOOGLE_SCRIPT_URL or not GOOGLE_SCRIPT_SECRET):
-        raise OperationalFailure("Google Sheet URL or GOOGLE_SCRIPT_SECRET is not configured")
+    failures=[]
     processed=0
     for event in events:
         if processed>=max_events:
@@ -800,20 +802,15 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
                 column="open_sync_status" if event["phase"]=="open" else "close_sync_status"
                 conn.execute(f"UPDATE trades SET {column}=? WHERE trade_id=?",("pending" if pending else "synced",event["trade_id"]))
             else:
-                conn.execute("UPDATE sheet_outbox SET state=CASE WHEN attempts+1>=10 THEN 'failed' ELSE 'pending' END,attempts=attempts+1,last_error=?,updated_at=? WHERE event_id=?",(last_error,stamp(),event["event_id"]))
+                conn.execute("UPDATE sheet_outbox SET state='pending',attempts=attempts+1,last_error=?,updated_at=? WHERE event_id=?",(last_error,stamp(),event["event_id"]))
                 failures.append(f"{event['event_id']}: {last_error}")
     deferred=max(0,len(events)-processed)
     if deferred:
         print(f"Deferred {deferred} Sheet outbox event(s) to a later run to preserve the workflow deadline.")
     if failures:
-        raise OperationalFailure(f"{len(failures)} Sheet outbox event(s) unsynchronized: {failures[0]}")
-
-
-def require_sheet_sync_configuration():
-    if not GOOGLE_SCRIPT_URL or not GOOGLE_SCRIPT_SECRET:
-        raise OperationalFailure(
-            "Google Sheet URL and GOOGLE_SCRIPT_SECRET are required before opening a new position"
-        )
+        print(f"{len(failures)} Sheet outbox event(s) remain queued: {failures[0]}", file=sys.stderr)
+        return False
+    return True
 
 
 def get_open_trades(read_only=False):
@@ -1242,11 +1239,9 @@ def run_trade_workflow():
     if not bool(getattr(clock,"is_open",False)):
         print(f"Market closed; neutral skip. Next open: {getattr(clock,'next_open','unknown')}"); return 0
     close_due_trades(client,reconciliation,run_deadline)
-    sync_sheet_outbox(deadline=run_deadline)
     now=datetime.now(EASTERN)
     if now.time()<time(12):
         print("Morning position-management run complete; new openings skipped."); return 0
-    require_sheet_sync_configuration()
     market_close=getattr(clock,"next_close",None)
     if not isinstance(market_close,datetime): raise OperationalFailure("Broker clock did not provide this session's close")
     next_open=getattr(clock,"next_open",None)
@@ -1261,7 +1256,7 @@ def run_trade_workflow():
     for item in todays:
         if "after" in str(item.get("when") or "").lower(): open_candidate(client,item,"AMC",now.date(),market_close,run_deadline)
         elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: current-session record is not AMC.")
-    sync_sheet_outbox(deadline=run_deadline); return 0
+    return 0
 
 
 def run_reconcile_only():
@@ -1293,17 +1288,28 @@ def run_migrate_only():
     return 0
 
 
+def run_sheet_sync_only():
+    """Deliver queued Sheet events without contacting Alpaca or blocking trading."""
+    configured_mode()
+    if not DB_PATH.exists():
+        raise OperationalFailure(f"SQLite ledger does not exist at {DB_PATH}")
+    init_db()
+    return 0 if sync_sheet_outbox() else 2
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser()
     parser.add_argument("--reconcile-only",action="store_true",help="compare the explicitly configured Alpaca account and SQLite without mutations")
     parser.add_argument("--migrate-only",action="store_true",help="apply only the additive SQLite migration")
     parser.add_argument("--bind-only",action="store_true",help="migrate and bind a safe ledger to the explicitly configured Alpaca account without trading")
+    parser.add_argument("--sync-sheet",action="store_true",help="deliver queued Sheet events without contacting Alpaca")
     args=parser.parse_args(argv)
-    if sum((args.reconcile_only,args.migrate_only,args.bind_only))>1:
-        parser.error("choose only one of --reconcile-only, --migrate-only, or --bind-only")
+    if sum((args.reconcile_only,args.migrate_only,args.bind_only,args.sync_sheet))>1:
+        parser.error("choose only one workflow mode")
     try:
         if args.migrate_only: return run_migrate_only()
         if args.bind_only: return run_bind_only()
+        if args.sync_sheet: return run_sheet_sync_only()
         return run_reconcile_only() if args.reconcile_only else run_trade_workflow()
     except ReconciliationFailure as exc:
         print(f"Reconciliation failure: {redact(exc)}",file=sys.stderr); return 4

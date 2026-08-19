@@ -1,3 +1,7 @@
+/**
+ * @OnlyCurrentDoc
+ */
+
 var SHEET_NAME = "Earnings";
 var AUTH_PROPERTY_NAME = "GOOGLE_SCRIPT_SECRET";
 var LOCK_TIMEOUT_MS = 30000;
