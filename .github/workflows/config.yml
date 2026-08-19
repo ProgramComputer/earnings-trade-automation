@@ -1,84 +1,244 @@
 name: Earnings Trade Automation
 
-# This workflow runs on push, pull request, and at key US market times for trade open/close (per trade_key_points.md)
 on:
   schedule:
-    # 9:40 AM ET (Eastern Time)
-    - cron: '40 13 * * 1-5' # 9:40 AM ET during EST (UTC-5)
-    - cron: '40 14 * * 1-5' # 9:40 AM ET during EDT (UTC-4)
-    # 3:35 PM ET (Eastern Time)
-    - cron: '35 19 * * 1-5' # 3:35 PM ET during EST (UTC-5)
-    - cron: '35 20 * * 1-5' # 3:35 PM ET during EDT (UTC-4)
+    - cron: '40 9 * * 1-5'
+      timezone: 'America/New_York'
+    - cron: '35 15 * * 1-5'
+      timezone: 'America/New_York'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PAPER workflow mode'
+        required: true
+        default: 'reconcile-only'
+        type: choice
+        options:
+          - reconcile-only
+          - paper-trade
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: earnings-trade-automation-paper
+  cancel-in-progress: false
 
 jobs:
-  build:
+  trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
-      ALPACA_PAPER: ${{ vars.ALPACA_PAPER }}
+      ALPACA_PAPER: 'true'
+      APCA_API_BASE_URL: 'https://paper-api.alpaca.markets'
       APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
       APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
       GOOGLE_SCRIPT_URL: ${{ secrets.GOOGLE_SCRIPT_URL }}
+      GOOGLE_SCRIPT_SECRET: ${{ secrets.GOOGLE_SCRIPT_SECRET }}
+      MANUAL_MODE: ${{ inputs.mode }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: true
 
+      - name: Confirm PAPER-only configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${ALPACA_PAPER}" != "true" ]]; then
+            echo "::error::Trading is disabled because ALPACA_PAPER is not exactly true."
+            exit 78
+          fi
+          if [[ "${APCA_API_BASE_URL}" != "https://paper-api.alpaca.markets" ]]; then
+            echo "::error::Trading is disabled because the configured Alpaca endpoint is not the PAPER endpoint."
+            exit 78
+          fi
+          if [[ -z "${APCA_API_KEY_ID}" || -z "${APCA_API_SECRET_KEY}" ]]; then
+            echo "::error::Required Alpaca PAPER credentials are not configured."
+            exit 78
+          fi
+
+      - name: Check Alpaca PAPER market clock
+        id: market
+        shell: bash
+        run: |
+          set -euo pipefail
+          clock_file="${RUNNER_TEMP}/alpaca-paper-clock.json"
+          curl --silent --show-error --fail \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --header "APCA-API-KEY-ID: ${APCA_API_KEY_ID}" \
+            --header "APCA-API-SECRET-KEY: ${APCA_API_SECRET_KEY}" \
+            --output "${clock_file}" \
+            "${APCA_API_BASE_URL}/v2/clock"
+
+          if ! jq -e '(.is_open | type) == "boolean"' "${clock_file}" >/dev/null; then
+            echo "::error::Alpaca PAPER clock returned an invalid response."
+            exit 69
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            case "${MANUAL_MODE}" in
+              reconcile-only)
+                echo "run_mode=reconcile-only" >> "${GITHUB_OUTPUT}"
+                echo "Manual dispatch is restricted to read-only reconciliation."
+                ;;
+              paper-trade)
+                echo "run_mode=paper-trade" >> "${GITHUB_OUTPUT}"
+                echo "Manual dispatch explicitly selected PAPER trading."
+                ;;
+              *)
+                echo "run_mode=invalid" >> "${GITHUB_OUTPUT}"
+                ;;
+            esac
+          elif [[ "$(jq -r '.is_open' "${clock_file}")" == "true" ]]; then
+            echo "run_mode=paper-trade" >> "${GITHUB_OUTPUT}"
+            echo "Alpaca PAPER clock confirms the market is open."
+          else
+            echo "run_mode=market-closed" >> "${GITHUB_OUTPUT}"
+            next_open="$(jq -r '.next_open // "unknown"' "${clock_file}")"
+            echo "::notice::Alpaca PAPER clock reports the market closed; this scheduled run is a neutral skip. Next open: ${next_open}."
+          fi
+
+      - name: Validate workflow mode
+        shell: bash
+        env:
+          RUN_MODE: ${{ steps.market.outputs.run_mode }}
+        run: |
+          set -euo pipefail
+          case "${RUN_MODE}" in
+            paper-trade|reconcile-only|market-closed) ;;
+            *)
+              echo "::error::Workflow mode is empty or unrecognized; refusing all operational steps."
+              exit 78
+              ;;
+          esac
+          echo "Validated workflow mode: ${RUN_MODE}."
+
+      - name: Validate synchronization secrets
+        if: steps.market.outputs.run_mode == 'paper-trade'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GOOGLE_SCRIPT_URL}" || -z "${GOOGLE_SCRIPT_SECRET}" ]]; then
+            echo "::error::Google Sheet synchronization URL or authentication secret is not configured."
+            exit 78
+          fi
+          case "${GOOGLE_SCRIPT_URL}" in
+            https://script.google.com/macros/s/*/exec) ;;
+            *)
+              echo "::error::GOOGLE_SCRIPT_URL is not a valid Apps Script web deployment URL."
+              exit 78
+              ;;
+          esac
+
       - name: Set up Python 3.10
+        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Time pip install
+      - name: Install dependencies
+        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only'
+        shell: bash
         run: |
-          start=$(date +%s)
-          pip install -r requirements.txt
-          end=$(date +%s)
-          echo "Pip install duration: $((end-start)) seconds"
+          set -euo pipefail
+          started_at="$(date +%s)"
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          finished_at="$(date +%s)"
+          echo "Dependency installation took $((finished_at-started_at)) seconds."
 
-      - name: List installed packages
-        run: pip list
-
-      - name: Check for build files
+      - name: Run PAPER trading workflow
+        id: trading
+        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only'
+        continue-on-error: true
+        shell: bash
         run: |
-          find . -type d -name "__pycache__" || echo "No __pycache__ found"
-          find . -name "*.pyc" || echo "No .pyc files found"
-
-      - name: List workspace files
-        run: ls -alR
-
-      - name: Validate scheduled time
-        run: |
-          current_time=$(TZ="America/New_York" date +'%H:%M')
-          echo "Current ET Time: $current_time"
-          current_minutes=$((10#$(echo "$current_time" | cut -d: -f1)*60 + 10#$(echo "$current_time" | cut -d: -f2)))
-          if ! (( (current_minutes >= 580 && current_minutes <= 610) || (current_minutes >= 935 && current_minutes <= 965) )); then
-            echo "Not within valid time window (09:40-10:10 or 15:35-16:05 ET). Exiting."
-            exit 1
-          fi
-
-   
-      - name: Run workflow
-        run: python trade_workflow.py
-        # The bot logic (timing, sizing, etc.) is defined in trade_key_points.md
-
-
-      - name: Commit updated trades.db
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add trades.db
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
+          set -uo pipefail
+          if [[ "${{ steps.market.outputs.run_mode }}" == "reconcile-only" ]]; then
+            python trade_workflow.py --reconcile-only
           else
-            git commit -m "chore: update trades.db"
-            git push
+            python trade_workflow.py
           fi
+          workflow_status=$?
+          if [[ "${workflow_status}" -eq 4 ]]; then
+            echo "safety_failure=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "safety_failure=false" >> "${GITHUB_OUTPUT}"
+          fi
+          exit "${workflow_status}"
+
+      - name: Commit durable ledger updates
+        id: persist
+        if: always() && (steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only') && hashFiles('trades.db') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -- trades.db
+
+          if git diff --cached --quiet; then
+            echo "No trades.db changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: persist PAPER trading ledger [skip ci]"
+          push_succeeded=false
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              push_succeeded=true
+              break
+            fi
+
+            if [[ "${attempt}" -eq 3 ]]; then
+              break
+            fi
+
+            echo "Push attempt ${attempt} failed; refreshing the target branch before retrying."
+            git fetch origin "${GITHUB_REF_NAME}"
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              git rebase --abort || true
+              echo "::error::The remote branch changed incompatibly. The local database commit was not pushed."
+              exit 75
+            fi
+          done
+
+          if [[ "${push_succeeded}" != "true" ]]; then
+            echo "::error::A broker-state database commit was created locally but could not be pushed. Download the recovery artifact before rerunning."
+            exit 75
+          fi
+          echo "Persisted trades.db commit $(git rev-parse --short HEAD)."
+
+      - name: Preserve database recovery artifact
+        id: recovery
+        if: always() && (steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only') && hashFiles('trades.db') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: trades-db-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trades.db
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Disable schedule after a state-safety failure
+        if: always() && github.event_name == 'schedule' && (steps.trading.outputs.safety_failure == 'true' || steps.persist.outcome == 'failure')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/config.yml/disable"
+          echo "::error::Disabled Earnings Trade Automation after a trading or ledger-persistence failure."
+
+      - name: Propagate trading failure
+        if: always() && steps.trading.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::error::The PAPER trading workflow reported an operational failure. Ledger persistence and recovery artifact steps were still attempted."
+          exit 1
