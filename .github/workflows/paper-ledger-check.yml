@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -32,6 +33,15 @@ jobs:
           ref: fix/trading-safety
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Keep production schedule disabled
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/config.yml/disable"
+          echo "Production Earnings Trade Automation is disabled pending reconciliation."
 
       - name: Validate PAPER configuration
         id: configuration
