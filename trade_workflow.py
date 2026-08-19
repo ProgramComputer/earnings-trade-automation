@@ -161,6 +161,17 @@ def init_db():
         for name, definition in TRADE_COLUMNS.items():
             if name not in existing:
                 conn.execute(f'ALTER TABLE trades ADD COLUMN "{name}" {definition}')
+        # Populate stable parent keys and make them unique before creating any
+        # child table that references trades(trade_id). SQLite rejects even
+        # otherwise-unrelated writes when a foreign key targets a non-unique
+        # legacy column.
+        migrate_historical(conn)
+        trade_index=conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_trades_id'").fetchone()
+        if trade_index and " WHERE " in str(trade_index[0] or "").upper():
+            conn.execute("DROP INDEX ux_trades_id")
+            trade_index=None
+        if not trade_index:
+            conn.execute("CREATE UNIQUE INDEX ux_trades_id ON trades(trade_id)")
         schema_statements = (
         '''CREATE TABLE IF NOT EXISTS broker_orders(
           order_id TEXT PRIMARY KEY,trade_id TEXT NOT NULL,client_order_id TEXT,phase TEXT NOT NULL,
@@ -196,13 +207,6 @@ def init_db():
         )
         for statement in schema_statements:
             conn.execute(statement)
-        migrate_historical(conn)
-        trade_index=conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_trades_id'").fetchone()
-        if trade_index and " WHERE " in str(trade_index[0] or "").upper():
-            conn.execute("DROP INDEX ux_trades_id")
-            trade_index=None
-        if not trade_index:
-            conn.execute("CREATE UNIQUE INDEX ux_trades_id ON trades(trade_id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_fills_activity ON fills(broker_activity_id) WHERE broker_activity_id IS NOT NULL")
         for table in ("broker_orders", "fills"):
             if "commission_status" not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
