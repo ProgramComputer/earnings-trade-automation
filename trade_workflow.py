@@ -983,6 +983,34 @@ def validate_order_link(conn,order,link):
     return True,"matched"
 
 
+def broker_order_summary(order):
+    """Return non-secret order facts needed to investigate reconciliation blocks."""
+    legs=[]
+    for leg in getattr(order,"legs",None) or []:
+        legs.append({
+            "symbol":str(getattr(leg,"symbol","") or ""),
+            "ratio_quantity":str(getattr(leg,"ratio_qty","") or ""),
+            "side":enum_text(getattr(leg,"side","")),
+            "position_intent":enum_text(getattr(leg,"position_intent","")),
+        })
+    return {
+        "order_id":order_id(order),
+        "client_order_id":str(getattr(order,"client_order_id","") or ""),
+        "status":enum_text(getattr(order,"status","")),
+        "symbol":str(getattr(order,"symbol","") or ""),
+        "quantity":str(getattr(order,"qty","") or ""),
+        "filled_quantity":str(getattr(order,"filled_qty","") or ""),
+        "side":enum_text(getattr(order,"side","")),
+        "position_intent":enum_text(getattr(order,"position_intent","")),
+        "asset_class":enum_text(getattr(order,"asset_class","")),
+        "order_class":enum_text(getattr(order,"order_class","")),
+        "order_type":enum_text(getattr(order,"type","") or getattr(order,"order_type","")),
+        "time_in_force":enum_text(getattr(order,"time_in_force","")),
+        "limit_price":str(getattr(order,"limit_price","") or ""),
+        "legs":legs,
+    }
+
+
 def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identity=None):
     _,configured_name,_=configured_mode()
     if broker_mode is not None and broker_mode!=configured_name:
@@ -1041,11 +1069,11 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
         asset=enum_text(getattr(order,"asset_class",""))
         relevant=cid.startswith("eta-") or asset in {"option","us_option"} or bool(getattr(order,"legs",None))
         if link and not valid:
-            discrepancies.append({"type":"broker_order_link_validation_failed","order_id":order_id(order),"status":status,"reason":reason})
+            discrepancies.append({"type":"broker_order_link_validation_failed","reason":reason,**broker_order_summary(order)})
         elif not is_terminal_order(order):
-            discrepancies.append({"type":"known_order_still_active" if link else "unmatched_active_broker_order","order_id":order_id(order),"status":status})
+            discrepancies.append({"type":"known_order_still_active" if link else "unmatched_active_broker_order",**broker_order_summary(order)})
         elif relevant and not link:
-            discrepancies.append({"type":"unmatched_recent_option_order","order_id":order_id(order),"status":status})
+            discrepancies.append({"type":"unmatched_recent_option_order",**broker_order_summary(order)})
     result={"checked_at":stamp(),"broker_mode":broker_mode,
             "broker_account_fingerprint":broker_identity["account_fingerprint"],
             "configured_endpoint_confirmed":True,"broker_option_position_count":len(options),"broker_recent_order_count":len(orders),
