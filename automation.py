@@ -11,6 +11,7 @@ Always consult a professional financial advisor before making any investment dec
 import requests
 import yfinance as yf
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from scipy.interpolate import interp1d
 import numpy as np
 import threading
@@ -18,21 +19,40 @@ import urllib.parse
 import os
 from dotenv import load_dotenv
 import argparse
+import time as time_module
 from alpaca_integration import get_alpaca_option_chain, init_alpaca_client
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest, OptionSnapshotRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestBarRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import Adjustment, DataFeed
 import pandas as pd
 
 # Load environment variables from .env file
 load_dotenv()
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
+EASTERN = ZoneInfo("America/New_York")
+
+
+def get_json_with_retries(url, attempts=3):
+    """Fetch JSON without allowing an upstream request to hang the workflow."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=(5, 20))
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError) as error:
+            last_error = error
+            if attempt < attempts:
+                time_module.sleep(2 ** (attempt - 1))
+    raise RuntimeError(
+        f"Earnings data request failed after {attempts} attempts: {type(last_error).__name__}"
+    ) from last_error
 
 def filter_dates(dates):
-    today = datetime.today().date()
+    today = datetime.now(EASTERN).date()
     cutoff_date = today + timedelta(days=45)
     
     sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
@@ -52,40 +72,63 @@ def filter_dates(dates):
 
 
 def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True):
-    log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
-    log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
-    log_co = (price_data['Close'] / price_data['Open']).apply(np.log)
-    
-    log_oc = (price_data['Open'] / price_data['Close'].shift(1)).apply(np.log)
-    log_oc_sq = log_oc**2
-    
-    log_cc = (price_data['Close'] / price_data['Close'].shift(1)).apply(np.log)
-    log_cc_sq = log_cc**2
-    
+    """Return rolling annualized Yang-Zhang volatility.
+
+    Yang-Zhang combines de-meaned overnight and open-to-close variances with
+    the Rogers-Satchell range estimator.  Close-to-close squared returns are
+    not a substitute here because they double-count the overnight move.
+    """
+    required_columns = ['Open', 'High', 'Low', 'Close']
+    if any(column not in price_data for column in required_columns):
+        raise ValueError("Yang-Zhang requires Open, High, Low, and Close columns.")
+    prices = price_data[required_columns].astype(float).dropna()
+    if len(prices) < window + 1:
+        raise ValueError(f"Yang-Zhang {window}-day volatility requires at least {window + 1} complete bars.")
+    if (prices <= 0).any().any():
+        raise ValueError("Yang-Zhang requires strictly positive OHLC prices.")
+
+    log_ho = np.log(prices['High'] / prices['Open'])
+    log_lo = np.log(prices['Low'] / prices['Open'])
+    log_co = np.log(prices['Close'] / prices['Open'])
+
+    overnight_return = np.log(prices['Open'] / prices['Close'].shift(1))
+    open_to_close_return = log_co
     rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
-    
-    close_vol = log_cc_sq.rolling(
-        window=window,
-        center=False
-    ).sum() * (1.0 / (window - 1.0))
 
-    open_vol = log_oc_sq.rolling(
-        window=window,
-        center=False
-    ).sum() * (1.0 / (window - 1.0))
-
-    window_rs = rs.rolling(
-        window=window,
-        center=False
-    ).sum() * (1.0 / (window - 1.0))
+    overnight_var = overnight_return.rolling(window=window, center=False).var(ddof=1)
+    open_to_close_var = open_to_close_return.rolling(window=window, center=False).var(ddof=1)
+    window_rs = rs.rolling(window=window, center=False).mean()
 
     k = 0.34 / (1.34 + ((window + 1) / (window - 1)) )
-    result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
+    variance = overnight_var + k * open_to_close_var + (1 - k) * window_rs
+    result = variance.clip(lower=0).apply(np.sqrt) * np.sqrt(trading_periods)
 
     if return_last_only:
-        return result.iloc[-1]
+        value = result.iloc[-1]
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"Yang-Zhang {window}-day volatility is not finite and positive.")
+        return value
     else:
         return result.dropna()
+
+
+def completed_daily_history(price_data, as_of=None):
+    """Exclude a still-forming current-session daily bar from screening."""
+    if price_data is None or price_data.empty:
+        return price_data
+    completed = price_data.copy()
+    timestamps = pd.DatetimeIndex(pd.to_datetime(completed.index, errors='coerce'))
+    if timestamps.tz is None:
+        timestamps = timestamps.tz_localize(EASTERN)
+    else:
+        timestamps = timestamps.tz_convert(EASTERN)
+    valid = ~timestamps.isna()
+    completed = completed.loc[valid]
+    timestamps = timestamps[valid]
+    now_eastern = (as_of or datetime.now(timezone.utc)).astimezone(EASTERN)
+    if now_eastern.hour < 16:
+        completed = completed.loc[np.asarray(timestamps.date) < now_eastern.date()]
+    return completed
     
 
 def build_term_structure(days, ivs):
@@ -202,7 +245,7 @@ def compute_recommendation(ticker):
                     alpaca_success = True
                     print(f"[{ticker}] Successfully retrieved Alpaca IV data for {len(atm_iv)} expiries")
                     # Calculate term structure from Alpaca IV data
-                    today = datetime.today().date()
+                    today = datetime.now(EASTERN).date()
                     dtes = []
                     ivs = []
                     for exp_date, iv in atm_iv.items():
@@ -225,7 +268,8 @@ def compute_recommendation(ticker):
                             timeframe=TimeFrame.Day,
                             start=start_dt,
                             end=end_dt,
-                            feed=DataFeed.IEX
+                            feed=DataFeed.IEX,
+                            adjustment=Adjustment.ALL
                         )
                         
                         bars_response = stock_client.get_stock_bars(bars_request)
@@ -257,11 +301,12 @@ def compute_recommendation(ticker):
                                         'Date': bar.timestamp
                                     })
                                 
-                                if len(bars_data) >= 30:  # Need at least 30 days for Yang-Zhang
+                                if bars_data:
                                     price_df = pd.DataFrame(bars_data)
                                     price_df.set_index('Date', inplace=True)
                                     price_df.sort_index(inplace=True)  # Ensure data is sorted by date
-                                    
+                                    price_df = completed_daily_history(price_df)
+
                                     # Calculate RV using Yang-Zhang
                                     rv30 = yang_zhang(price_df)
                                     iv30_rv30 = term_spline(30) / rv30
@@ -270,7 +315,9 @@ def compute_recommendation(ticker):
                                     # Always use Yahoo for average volume calculation
                                     print(f"[{ticker}] Fetching volume data from Yahoo Finance")
                                     stock_yf = yf.Ticker(ticker)
-                                    price_history = stock_yf.history(period='3mo')
+                                    price_history = completed_daily_history(
+                                        stock_yf.history(period='3mo', auto_adjust=True)
+                                    )
                                     avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
                                     
                                     expected_move = str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
@@ -280,7 +327,7 @@ def compute_recommendation(ticker):
                                             'ts_slope_0_45': ts_slope_0_45 <= -0.00406, 
                                             'expected_move': expected_move}
                                 else:
-                                    print(f"[{ticker}] Not enough bars from Alpaca (need >= 30, got {len(bars_data)}). Falling back to Yahoo.")
+                                    print(f"[{ticker}] Not enough bars from Alpaca (need >= 31, got {len(bars_data)}). Falling back to Yahoo.")
                             else:
                                 print(f"[{ticker}] No bar data found in the Alpaca response. Falling back to Yahoo.")
                     except Exception as e:
@@ -342,7 +389,7 @@ def compute_recommendation(ticker):
             i += 1
         if not atm_iv:
             return "Error: Could not determine ATM IV for any expiration dates."
-        today = datetime.today().date()
+        today = datetime.now(EASTERN).date()
         dtes = []
         ivs = []
         for exp_date, iv in atm_iv.items():
@@ -354,7 +401,9 @@ def compute_recommendation(ticker):
         ts_slope_0_45 = (term_spline(45) - term_spline(dtes[0])) / (45-dtes[0])
         
         # Use Yahoo for RV calculation
-        price_history = stock.history(period='3mo')
+        price_history = completed_daily_history(
+            stock.history(period='3mo', auto_adjust=True)
+        )
         rv30 = yang_zhang(price_history)
         iv30_rv30 = term_spline(30) / rv30
         print(f"[{ticker}] Yahoo IV30={term_spline(30):.4f}, RV30={rv30:.4f}, Ratio={iv30_rv30:.4f}")
@@ -366,23 +415,21 @@ def compute_recommendation(ticker):
         return f"Error: {e}"
         
 
-def get_tomorrows_earnings():
-    # Determine next open market day using Alpaca clock; fallback to next calendar day
-    client = init_alpaca_client()
-    if client:
-        try:
-            clock = client.get_clock()
-            next_open_date = clock.next_open.date()
-        except Exception:
-            next_open_date = (datetime.now() + timedelta(days=1)).date()
+def get_tomorrows_earnings(next_open=None):
+    """Return earnings for Alpaca's next confirmed paper-market session."""
+    if next_open is None:
+        next_open = init_alpaca_client().get_clock().next_open
+    if isinstance(next_open, datetime):
+        next_open_date = next_open.astimezone(EASTERN).date()
+    elif hasattr(next_open, "isoformat"):
+        next_open_date = next_open
     else:
-        next_open_date = (datetime.now() + timedelta(days=1)).date()
+        raise RuntimeError("Alpaca PAPER clock did not provide a valid next-open date")
     tomorrow = next_open_date.strftime('%Y-%m-%d')
     base_url = "https://www.dolthub.com/api/v1alpha1/post-no-preference/earnings/master"
     query = f"SELECT * FROM `earnings_calendar` where date = '{tomorrow}' ORDER BY `act_symbol` ASC, `date` ASC LIMIT 1000;"
     url = f"{base_url}?q={urllib.parse.quote(query)}"
-    response = requests.get(url)
-    data = response.json()
+    data = get_json_with_retries(url)
     # Return a list of dicts with act_symbol and when
     tickers = [
         {'act_symbol': row['act_symbol'], 'when': row.get('when')}
@@ -391,12 +438,11 @@ def get_tomorrows_earnings():
     return tickers
 
 def get_todays_earnings():
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(EASTERN).strftime('%Y-%m-%d')
     base_url = "https://www.dolthub.com/api/v1alpha1/post-no-preference/earnings/master"
     query = f"SELECT * FROM `earnings_calendar` where date = '{today}' ORDER BY `act_symbol` ASC, `date` ASC LIMIT 1000;"
     url = f"{base_url}?q={urllib.parse.quote(query)}"
-    response = requests.get(url)
-    data = response.json()
+    data = get_json_with_retries(url)
     # Return a list of dicts with act_symbol and when
     tickers = [
         {'act_symbol': row['act_symbol'], 'when': row.get('when')}

@@ -1,0 +1,212 @@
+name: PAPER Ledger Check
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: paper-ledger-check
+  cancel-in-progress: false
+
+jobs:
+  verify-ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ALPACA_PAPER: 'true'
+      APCA_API_BASE_URL: 'https://paper-api.alpaca.markets'
+      APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+      APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      GOOGLE_SCRIPT_URL: ${{ secrets.GOOGLE_SCRIPT_URL }}
+      GOOGLE_SCRIPT_SECRET: ${{ secrets.GOOGLE_SCRIPT_SECRET }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate PAPER configuration
+        id: configuration
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${ALPACA_PAPER}" != "true" ]]; then
+            echo "::error::The ledger check requires explicit PAPER mode."
+            exit 78
+          fi
+          if [[ "${APCA_API_BASE_URL}" != "https://paper-api.alpaca.markets" ]]; then
+            echo "::error::The ledger check requires the Alpaca PAPER endpoint."
+            exit 78
+          fi
+          if [[ -z "${APCA_API_KEY_ID}" || -z "${APCA_API_SECRET_KEY}" ]]; then
+            echo "::error::Required Alpaca PAPER credentials are not configured."
+            exit 78
+          fi
+          echo "PAPER configuration and credential presence confirmed."
+
+      - name: Set up Python 3.10
+        id: python
+        if: steps.configuration.outcome == 'success'
+        continue-on-error: true
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        id: dependencies
+        if: steps.python.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Migrate SQLite ledger
+        id: migrate
+        if: steps.dependencies.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python trade_workflow.py --migrate-only
+
+      - name: Bind SQLite ledger to PAPER account
+        id: bind
+        if: steps.migrate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python trade_workflow.py --bind-only
+
+      - name: Reconcile PAPER account read-only
+        id: reconcile
+        if: steps.bind.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python trade_workflow.py --reconcile-only
+
+      - name: Validate Google synchronization prerequisites
+        id: synchronization
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=false
+          if [[ -z "${GOOGLE_SCRIPT_URL}" ]]; then
+            echo "::error::GOOGLE_SCRIPT_URL is not configured."
+            missing=true
+          fi
+          if [[ -z "${GOOGLE_SCRIPT_SECRET}" ]]; then
+            echo "::error::GOOGLE_SCRIPT_SECRET is not configured."
+            missing=true
+          fi
+          if [[ "${missing}" == "true" ]]; then
+            exit 78
+          fi
+          echo "Google synchronization prerequisite presence confirmed."
+
+      - name: Commit durable ledger updates
+        id: persist
+        if: always() && hashFiles('trades.db') != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -- trades.db
+
+          if git diff --cached --quiet; then
+            echo "No trades.db changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: persist PAPER ledger check [skip ci]"
+          pushed=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              pushed=true
+              break
+            fi
+
+            if [[ "${attempt}" -eq 3 ]]; then
+              break
+            fi
+
+            echo "Push attempt ${attempt} failed; refreshing main before retrying."
+            git fetch --no-tags origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "::error::Remote changes could not be rebased safely; recover trades.db from the artifact."
+              exit 75
+            fi
+          done
+
+          if [[ "${pushed}" != "true" ]]; then
+            echo "::error::The ledger commit could not be pushed; recover trades.db from the artifact."
+            exit 75
+          fi
+          echo "Persisted the migrated and bound PAPER ledger."
+
+      - name: Preserve database recovery artifact
+        id: recovery
+        if: always() && hashFiles('trades.db') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trades.db
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Propagate ledger check failure
+        if: always()
+        shell: bash
+        env:
+          CONFIGURATION_OUTCOME: ${{ steps.configuration.outcome }}
+          PYTHON_OUTCOME: ${{ steps.python.outcome }}
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          MIGRATE_OUTCOME: ${{ steps.migrate.outcome }}
+          BIND_OUTCOME: ${{ steps.bind.outcome }}
+          RECONCILE_OUTCOME: ${{ steps.reconcile.outcome }}
+          SYNCHRONIZATION_OUTCOME: ${{ steps.synchronization.outcome }}
+          PERSIST_OUTCOME: ${{ steps.persist.outcome }}
+          RECOVERY_OUTCOME: ${{ steps.recovery.outcome }}
+        run: |
+          set -euo pipefail
+          failed=false
+          for outcome in \
+            "${CONFIGURATION_OUTCOME}" \
+            "${PYTHON_OUTCOME}" \
+            "${DEPENDENCIES_OUTCOME}" \
+            "${MIGRATE_OUTCOME}" \
+            "${BIND_OUTCOME}" \
+            "${RECONCILE_OUTCOME}" \
+            "${SYNCHRONIZATION_OUTCOME}" \
+            "${PERSIST_OUTCOME}" \
+            "${RECOVERY_OUTCOME}"; do
+            if [[ "${outcome}" != "success" ]]; then
+              failed=true
+            fi
+          done
+
+          if [[ "${failed}" == "true" ]]; then
+            echo "::error::The PAPER ledger check failed. Database persistence and recovery were attempted before this failure was reported."
+            exit 1
+          fi
+          echo "PAPER ledger migration, binding, and read-only reconciliation completed successfully."

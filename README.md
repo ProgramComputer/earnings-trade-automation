@@ -17,7 +17,7 @@ We implement an earnings volatility selling strategy focusing on calendar spread
 - Screening Criteria: Filter for high-probability trades using:
   - **Term Structure Slope**: Negative slope between front-month and 45-day expirations (backwardation).
   - **30-Day Average Volume**: Ensures sufficient liquidity and price-insensitive demand.
-  - **IV/RV Ratio**: High implied-to-realized volatility ratio indicates overpriced options.
+  - **IV/RV Ratio**: High implied-to-realized volatility ratio indicates overpriced options; realized volatility is estimated using the 30-day Yang–Zhang estimator.
 - Position Sizing: Apply a 10% Kelly fraction for optimal, risk-managed sizing.
 
 ## Quick Start
@@ -31,13 +31,22 @@ cd earnings-calendar-spread-bot
 ### 2. Google Sheets Set Up (Optional)
 Create a copy of https://docs.google.com/spreadsheets/d/1qOu4PJtcpYwLZgFFIpVr8FXD12dXoWZaKxSeg9FR7lU/ and add code.gs to App Script
 
+#### Apps Script Request Authentication
+Generate one long random secret and store the same value in both places:
+
+- In Apps Script, open **Project Settings > Script Properties** and add `GOOGLE_SCRIPT_SECRET`.
+- In GitHub, open **Settings > Secrets and variables > Actions** and add `GOOGLE_SCRIPT_SECRET`.
+
+Never commit this secret, place it in Sheet cells, or print it in logs.
+
 ### 3. Set Up Environment Variables
 Create a `.env` file in the root directory with your credentials:
 ```
 APCA_API_KEY_ID=your-alpaca-key
 APCA_API_SECRET_KEY=your-alpaca-secret
 GOOGLE_SCRIPT_URL=your-google-apps-script-url
-ALPACA_PAPER=true  # Set to 'false' to use live trading (default is 'true' for paper trading)
+ALPACA_PAPER=true  # Set explicitly to 'false' to use live trading
+APCA_API_BASE_URL=https://paper-api.alpaca.markets
 ```
 
 ### 4. Install Dependencies
@@ -60,6 +69,13 @@ python automation.py
 - Fork the repository to your GitHub account (required to enable Actions).
 - In your fork, navigate to **Settings > Secrets > Actions** and add your environment variables.
 - Enable the GitHub Actions workflow in the **Actions** tab.
+
+#### Workflow Modes
+- `paper-trade`: Reconciles state first, then permits Alpaca PAPER orders.
+- `reconcile-only`: The default manual mode; reconciles state and never submits orders.
+- `market-closed`: A neutral scheduled skip with no Python, synchronization, or database-persistence work.
+
+The included GitHub Actions workflow is explicitly configured for PAPER trading. A separate live application configuration must explicitly select live mode and the live Alpaca endpoint, use a non-default ledger path, and bind that ledger to the intended account.
 
 
 ## Example Workflow
