@@ -29,6 +29,8 @@ cd earnings-calendar-spread-bot
 ```
 
 ### 2. Google Sheets Set Up (Optional)
+Create a copy of https://docs.google.com/spreadsheets/d/1qOu4PJtcpYwLZgFFIpVr8FXD12dXoWZaKxSeg9FR7lU/ and add code.gs to App Script
+
 Sheet synchronization is optional. Without `GOOGLE_SCRIPT_URL` and `GOOGLE_SCRIPT_SECRET`, fill events remain queued in SQLite and the workflow continues. When configured, a separate best-effort step delivers queued events through the connected Sheet's Apps Script deployment; a Sheet failure does not block reconciliation, position management, or new PAPER orders.
 
 To authenticate requests, generate one long random secret and store the same value in both places:
