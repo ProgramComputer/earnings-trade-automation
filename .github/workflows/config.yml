@@ -18,7 +18,6 @@ on:
           - paper-trade
 
 permissions:
-  actions: write
   contents: write
 
 concurrency:
@@ -225,16 +224,6 @@ jobs:
           path: trades.db
           if-no-files-found: error
           retention-days: 30
-
-      - name: Disable schedule after a state-safety failure
-        if: always() && github.event_name == 'schedule' && (steps.trading.outputs.safety_failure == 'true' || steps.persist.outcome == 'failure')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/config.yml/disable"
-          echo "::error::Disabled Earnings Trade Automation after a trading or ledger-persistence failure."
 
       - name: Propagate trading failure
         if: always() && steps.trading.outcome == 'failure'

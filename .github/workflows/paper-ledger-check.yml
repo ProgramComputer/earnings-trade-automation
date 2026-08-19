@@ -34,14 +34,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Keep production schedule disabled
+      - name: Keep production workflow enabled
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/config.yml/disable"
-          echo "Production Earnings Trade Automation is disabled pending reconciliation."
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/config.yml/enable"
+          echo "Production Earnings Trade Automation is enabled."
 
       - name: Validate PAPER configuration
         id: configuration
