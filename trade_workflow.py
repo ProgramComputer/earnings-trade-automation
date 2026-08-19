@@ -161,11 +161,16 @@ def init_db():
         for name, definition in TRADE_COLUMNS.items():
             if name not in existing:
                 conn.execute(f'ALTER TABLE trades ADD COLUMN "{name}" {definition}')
+        conn.execute('''CREATE TABLE IF NOT EXISTS schema_migrations(
+          migration_name TEXT PRIMARY KEY,applied_at TEXT NOT NULL)''')
         # Populate stable parent keys and make them unique before creating any
         # child table that references trades(trade_id). SQLite rejects even
         # otherwise-unrelated writes when a foreign key targets a non-unique
         # legacy column.
-        migrate_historical(conn)
+        historical_migration="historical_cashflow_identity_v1"
+        if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_name=?",(historical_migration,)).fetchone():
+            migrate_historical(conn)
+            conn.execute("INSERT INTO schema_migrations VALUES(?,?)",(historical_migration,stamp()))
         trade_index=conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_trades_id'").fetchone()
         if trade_index and " WHERE " in str(trade_index[0] or "").upper():
             conn.execute("DROP INDEX ux_trades_id")
