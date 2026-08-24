@@ -4,7 +4,9 @@ on:
   schedule:
     - cron: '40 9 * * 1-5'
       timezone: 'America/New_York'
-    - cron: '35 15 * * 1-5'
+    - cron: '45 14 * * 1-5'
+      timezone: 'America/New_York'
+    - cron: '15 15 * * 1-5'
       timezone: 'America/New_York'
   workflow_dispatch:
     inputs:
@@ -27,7 +29,7 @@ concurrency:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 105
     env:
       ALPACA_PAPER: 'true'
       APCA_API_BASE_URL: 'https://paper-api.alpaca.markets'
@@ -135,6 +137,68 @@ jobs:
           python -m pip install --disable-pip-version-check -r requirements.txt
           finished_at="$(date +%s)"
           echo "Dependency installation took $((finished_at-started_at)) seconds."
+
+      - name: Wait for PAPER entry window
+        if: >-
+          steps.market.outputs.run_mode == 'paper-trade' &&
+          github.event_name == 'schedule' &&
+          (github.event.schedule == '45 14 * * 1-5' || github.event.schedule == '15 15 * * 1-5')
+        shell: bash
+        run: |
+          set -euo pipefail
+          clock_file="${RUNNER_TEMP}/alpaca-paper-entry-clock.json"
+
+          while true; do
+            curl --silent --show-error --fail \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --retry-max-time 120 \
+              --header "APCA-API-KEY-ID: ${APCA_API_KEY_ID}" \
+              --header "APCA-API-SECRET-KEY: ${APCA_API_SECRET_KEY}" \
+              --output "${clock_file}" \
+              "${APCA_API_BASE_URL}/v2/clock"
+
+            if ! jq -e '
+              (.is_open | type) == "boolean" and
+              (.timestamp | type) == "string" and
+              (.next_close | type) == "string"
+            ' "${clock_file}" >/dev/null; then
+              echo "::error::Alpaca PAPER clock returned an invalid entry-window response."
+              exit 69
+            fi
+
+            if [[ "$(jq -r '.is_open' "${clock_file}")" != "true" ]]; then
+              echo "::notice::Alpaca PAPER market closed while waiting; continuing for a neutral application-level skip."
+              exit 0
+            fi
+
+            broker_now="$(jq -r '.timestamp' "${clock_file}")"
+            next_close="$(jq -r '.next_close' "${clock_file}")"
+            broker_now_epoch="$(date --date="${broker_now}" +%s)"
+            next_close_epoch="$(date --date="${next_close}" +%s)"
+            entry_epoch=$((next_close_epoch - 25 * 60))
+            cutoff_epoch=$((next_close_epoch - 3 * 60))
+
+            if (( broker_now_epoch >= cutoff_epoch )); then
+              echo "::notice::The PAPER entry cutoff has passed; continuing for reconciliation and position management only."
+              exit 0
+            fi
+
+            if (( broker_now_epoch >= entry_epoch )); then
+              echo "Alpaca PAPER clock confirms the 25-minute entry window is open."
+              exit 0
+            fi
+
+            wait_seconds=$((entry_epoch - broker_now_epoch))
+            if (( wait_seconds > 60 )); then
+              wait_seconds=60
+            fi
+            echo "Waiting ${wait_seconds} seconds for the Alpaca PAPER entry window."
+            sleep "${wait_seconds}"
+          done
 
       - name: Run PAPER trading workflow
         id: trading

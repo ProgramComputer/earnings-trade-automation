@@ -1092,7 +1092,7 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
 def is_time_to_open(earnings_date,when,market_close):
     now=datetime.now(EASTERN); close_at=market_close.astimezone(EASTERN)
     intended=close_at.date() if when=="BMO" else earnings_date
-    return close_at.date()==intended and close_at-timedelta(minutes=25)<=now<close_at
+    return close_at.date()==intended and close_at-timedelta(minutes=25)<=now<close_at-timedelta(minutes=3)
 
 
 def is_time_to_close(earnings_date,when):
@@ -1244,6 +1244,8 @@ def run_trade_workflow():
         print("Morning position-management run complete; new openings skipped."); return 0
     market_close=getattr(clock,"next_close",None)
     if not isinstance(market_close,datetime): raise OperationalFailure("Broker clock did not provide this session's close")
+    if now>=market_close.astimezone(EASTERN)-timedelta(minutes=3):
+        print("PAPER entry cutoff reached; reconciliation and position management complete; new openings skipped."); return 0
     next_open=getattr(clock,"next_open",None)
     if not isinstance(next_open,datetime): raise OperationalFailure("Broker clock did not provide the next session open")
     next_session_date=next_open.astimezone(EASTERN).date()
