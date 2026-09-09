@@ -22,6 +22,7 @@ from alpaca.trading.enums import PositionIntent
 
 from automation import compute_recommendation, get_todays_earnings, get_tomorrows_earnings
 from alpaca_integration import (
+    QuoteValidationError,
     close_calendar_spread_order, close_single_option_leg_order,
     get_alpaca_option_chain, get_spread_quotes, init_alpaca_client,
     place_calendar_spread_order, select_expiries_and_strike_alpaca,
@@ -769,10 +770,19 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
             break
         processed+=1
         payload=json.loads(event["payload_json"])
+        with db() as conn:
+            sync_state=conn.execute(
+                "SELECT open_sync_status,close_sync_status FROM trades WHERE trade_id=?",
+                (event["trade_id"],),
+            ).fetchone()
+        if not sync_state:
+            raise OperationalFailure(f"Cannot sync Sheet event for unknown trade {event['trade_id']}")
         payload["Broker Mode"]=identity["broker_mode"]
         payload["Broker Account Fingerprint"]=identity["account_fingerprint"]
         payload["P&L Status"]=pnl_status(event["outbox_realized_pnl_cents"],event["outbox_commission_status"])
         payload["auth_token"]=GOOGLE_SCRIPT_SECRET
+        payload["Open Sync Status"]=sync_state["open_sync_status"] or ""
+        payload["Close Sync Status"]=sync_state["close_sync_status"] or ""
         payload["Open Sync Status"]="synced" if event["phase"]=="open" else payload.get("Open Sync Status","")
         payload["Close Sync Status"]="synced" if event["phase"]=="close" else payload.get("Close Sync Status","")
         ok=False; last_error="unknown error"
@@ -1120,7 +1130,21 @@ def mark_no_fill(trade_id,result):
             conn.execute("UPDATE trades SET lifecycle_status='CANCELED_NO_FILL',reconciliation_status=?,updated_at=? WHERE trade_id=?",(str(getattr(result,"stop_reason","no_fill") or "no_fill"),stamp(),trade_id))
 
 
+def record_close_quote_failure(trade_id, error):
+    detail=" ".join(redact(error).splitlines())[:500]
+    status=f"CLOSE_QUOTE_VALIDATION_FAILED: {detail}"
+    with db(write=True) as conn:
+        cursor=conn.execute(
+            "UPDATE trades SET reconciliation_status=?,updated_at=? WHERE trade_id=?",
+            (status,stamp(),trade_id),
+        )
+        if cursor.rowcount != 1:
+            raise OperationalFailure(f"Unable to record close failure for unknown trade {trade_id}")
+    return status
+
+
 def close_due_trades(client,reconciliation,run_deadline):
+    failures=[]
     for trade in get_open_trades():
         if time_module.monotonic()+60>=run_deadline:
             raise OperationalFailure("Run deadline reached before all due positions were processed")
@@ -1131,27 +1155,38 @@ def close_due_trades(client,reconciliation,run_deadline):
         account_snapshot(client)
         operation_deadline=min(time_module.monotonic()+240,run_deadline)
         common={"max_attempts":8,"overall_timeout":240,"attempt_timeout":30,"cancel_timeout":30}
-        if state=="MATCHED_SPREAD":
-            method="calendar_spread"
-            prefix=reserve_operation_prefix(tid,"close",method)
-            result=close_calendar_spread_order(trade["Short Symbol"],trade["Long Symbol"],qty,max_close_debit=Decimal(os.environ.get("MAX_CLOSE_DEBIT","0.50")),
-              on_terminal=lambda event,tid=tid:record_fill(tid,"close","calendar_spread",event,"scheduled_post_earnings_close"),
-              on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
-              on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","calendar_spread",order,{**context,"submission_only":True}),
-              before_submit=before_submit_guard(close_requires_debit=True,deadline=operation_deadline),
-              client_order_id_prefix=prefix,**common)
-        elif state=="SHORT_EXPIRED_LONG_REMAINS":
-            method="single_long_sell"
-            prefix=reserve_operation_prefix(tid,"close",method)
-            result=close_single_option_leg_order(trade["Long Symbol"],qty,PositionIntent.SELL_TO_CLOSE,min_sell_price=Decimal(os.environ.get("MIN_LONG_LEG_CLOSE_PRICE","0.01")),
-              on_terminal=lambda event,tid=tid:record_fill(tid,"close","single_long_sell",event,"confirmed_short_expiry_long_leg_sale"),
-              on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","single_long_sell",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
-              on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","single_long_sell",order,{**context,"submission_only":True}),
-              before_submit=before_submit_guard(close_requires_debit=False,deadline=operation_deadline),
-              client_order_id_prefix=prefix,**common)
-        else: raise ReconciliationFailure(f"Trade {tid} has no safe close path")
+        try:
+            if state=="MATCHED_SPREAD":
+                method="calendar_spread"
+                prefix=reserve_operation_prefix(tid,"close",method)
+                result=close_calendar_spread_order(trade["Short Symbol"],trade["Long Symbol"],qty,max_close_debit=Decimal(os.environ.get("MAX_CLOSE_DEBIT","0.50")),
+                  on_terminal=lambda event,tid=tid:record_fill(tid,"close","calendar_spread",event,"scheduled_post_earnings_close"),
+                  on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
+                  on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","calendar_spread",order,{**context,"submission_only":True}),
+                  before_submit=before_submit_guard(close_requires_debit=True,deadline=operation_deadline),
+                  client_order_id_prefix=prefix,**common)
+            elif state=="SHORT_EXPIRED_LONG_REMAINS":
+                method="single_long_sell"
+                prefix=reserve_operation_prefix(tid,"close",method)
+                result=close_single_option_leg_order(trade["Long Symbol"],qty,PositionIntent.SELL_TO_CLOSE,min_sell_price=Decimal(os.environ.get("MIN_LONG_LEG_CLOSE_PRICE","0.01")),
+                  on_terminal=lambda event,tid=tid:record_fill(tid,"close","single_long_sell",event,"confirmed_short_expiry_long_leg_sale"),
+                  on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","single_long_sell",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
+                  on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","single_long_sell",order,{**context,"submission_only":True}),
+                  before_submit=before_submit_guard(close_requires_debit=False,deadline=operation_deadline),
+                  client_order_id_prefix=prefix,**common)
+            else: raise ReconciliationFailure(f"Trade {tid} has no safe close path")
+        except QuoteValidationError as exc:
+            status=record_close_quote_failure(tid,exc)
+            failures.append(f"trade={tid} {status}")
+            print(f"Close unresolved after bounded quote retries: trade={tid} {status}",file=sys.stderr)
+            continue
         finalize_execution(tid,result)
         print(f"Close result trade={tid} method={method} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}")
+    if failures:
+        raise OperationalFailure(
+            f"{len(failures)} due trade close(s) remain unresolved after quote validation retries: "
+            + "; ".join(failures)
+        )
 
 
 def candidate_allocation(client,spread_cost):

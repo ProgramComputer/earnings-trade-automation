@@ -33,6 +33,8 @@ Create a copy of https://docs.google.com/spreadsheets/d/1qOu4PJtcpYwLZgFFIpVr8FX
 
 Sheet synchronization is optional. Without `GOOGLE_SCRIPT_URL` and `GOOGLE_SCRIPT_SECRET`, fill events remain queued in SQLite and the workflow continues. When configured, a separate best-effort step delivers queued events through the connected Sheet's Apps Script deployment; a Sheet failure does not block reconciliation, position management, or new PAPER orders.
 
+After updating `code.gs`, deploy a new version of the existing Apps Script web app. The first authenticated fill request adds missing tracking columns to the original template and updates its return formulas for fill-based records, preserving historical trades. No manual fill entry is needed. The Actions summary reports pending Sheet updates even when trading succeeds.
+
 To authenticate requests, generate one long random secret and store the same value in both places:
 
 - In Apps Script, open **Project Settings > Script Properties** and add `GOOGLE_SCRIPT_SECRET`.

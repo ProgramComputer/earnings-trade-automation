@@ -26,6 +26,8 @@ DEFAULT_OVERALL_TIMEOUT = 180
 DEFAULT_ATTEMPT_TIMEOUT = 30
 DEFAULT_CANCEL_TIMEOUT = 20
 DEFAULT_QUOTE_MAX_AGE_SECONDS = 30
+DEFAULT_QUOTE_FETCH_ATTEMPTS = 3
+DEFAULT_QUOTE_RETRY_DELAY_SECONDS = 2
 _OPTION_CHAIN_CACHE = {}
 
 
@@ -360,16 +362,24 @@ def _quote_timestamp(value, symbol):
 def _validated_quote(quote, symbol, max_age_seconds):
     if quote is None:
         raise QuoteValidationError(f"Missing quote for {symbol}.")
-    bid = _decimal(getattr(quote, "bid_price", None), f"{symbol} bid")
-    ask = _decimal(getattr(quote, "ask_price", None), f"{symbol} ask")
+    try:
+        bid = _decimal(getattr(quote, "bid_price", None), f"{symbol} bid")
+        ask = _decimal(getattr(quote, "ask_price", None), f"{symbol} ask")
+    except ValueError as exc:
+        raise QuoteValidationError(str(exc)) from exc
     if bid < 0 or ask <= 0:
         raise QuoteValidationError(f"Invalid non-positive quote for {symbol}: bid={bid}, ask={ask}.")
     if bid > ask:
         raise QuoteValidationError(f"Crossed quote for {symbol}: bid={bid}, ask={ask}.")
     for size_name in ("bid_size", "ask_size"):
         size = getattr(quote, size_name, None)
-        if size is not None and _decimal(size, f"{symbol} {size_name}") <= 0:
-            raise QuoteValidationError(f"Quote for {symbol} has zero {size_name}.")
+        if size is not None:
+            try:
+                valid_size = _decimal(size, f"{symbol} {size_name}")
+            except ValueError as exc:
+                raise QuoteValidationError(str(exc)) from exc
+            if valid_size <= 0:
+                raise QuoteValidationError(f"Quote for {symbol} has zero {size_name}.")
     quote_time = _quote_timestamp(getattr(quote, "timestamp", None), symbol)
     age = (datetime.now(timezone.utc) - quote_time).total_seconds()
     if age < -5 or age > max_age_seconds:
@@ -379,35 +389,90 @@ def _validated_quote(quote, symbol, max_age_seconds):
     return bid, ask
 
 
-def _fetch_spread_quote_snapshot(short_symbol, long_symbol, max_age_seconds):
+def _retry_validated_quote_fetch(
+    fetch_once,
+    description,
+    *,
+    attempts=DEFAULT_QUOTE_FETCH_ATTEMPTS,
+    retry_delay_seconds=DEFAULT_QUOTE_RETRY_DELAY_SECONDS,
+):
+    """Retry only rejected quote snapshots; every snapshot still passes all guards."""
+    if attempts < 1 or retry_delay_seconds < 0:
+        raise ValueError("Quote retry attempts must be positive and delay cannot be negative")
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_once()
+        except QuoteValidationError as exc:
+            if attempt == attempts:
+                raise
+            print(
+                f"Quote validation failed for {description} "
+                f"(attempt {attempt}/{attempts}): {exc} Retrying."
+            )
+            if retry_delay_seconds:
+                time.sleep(retry_delay_seconds)
+
+
+def _fetch_spread_quote_snapshot(
+    short_symbol,
+    long_symbol,
+    max_age_seconds,
+    *,
+    validation_attempts=DEFAULT_QUOTE_FETCH_ATTEMPTS,
+    validation_retry_delay_seconds=DEFAULT_QUOTE_RETRY_DELAY_SECONDS,
+):
     _require_explicit_trading_mode()
     options_client = OptionHistoricalDataClient(
         api_key=os.environ.get("APCA_API_KEY_ID"),
         secret_key=os.environ.get("APCA_API_SECRET_KEY"),
     )
-    response = options_client.get_option_latest_quote(
-        OptionLatestQuoteRequest(symbol_or_symbols=[short_symbol, long_symbol])
+
+    def fetch_once():
+        response = options_client.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=[short_symbol, long_symbol])
+        )
+        short_bid, short_ask = _validated_quote(
+            response.get(short_symbol), short_symbol, max_age_seconds
+        )
+        long_bid, long_ask = _validated_quote(
+            response.get(long_symbol), long_symbol, max_age_seconds
+        )
+        return SpreadQuoteSnapshot(short_bid, short_ask, long_bid, long_ask)
+
+    return _retry_validated_quote_fetch(
+        fetch_once,
+        f"{short_symbol}/{long_symbol}",
+        attempts=validation_attempts,
+        retry_delay_seconds=validation_retry_delay_seconds,
     )
-    short_bid, short_ask = _validated_quote(
-        response.get(short_symbol), short_symbol, max_age_seconds
-    )
-    long_bid, long_ask = _validated_quote(
-        response.get(long_symbol), long_symbol, max_age_seconds
-    )
-    return SpreadQuoteSnapshot(short_bid, short_ask, long_bid, long_ask)
 
 
-def _fetch_single_quote_snapshot(symbol, max_age_seconds):
+def _fetch_single_quote_snapshot(
+    symbol,
+    max_age_seconds,
+    *,
+    validation_attempts=DEFAULT_QUOTE_FETCH_ATTEMPTS,
+    validation_retry_delay_seconds=DEFAULT_QUOTE_RETRY_DELAY_SECONDS,
+):
     _require_explicit_trading_mode()
     options_client = OptionHistoricalDataClient(
         api_key=os.environ.get("APCA_API_KEY_ID"),
         secret_key=os.environ.get("APCA_API_SECRET_KEY"),
     )
-    response = options_client.get_option_latest_quote(
-        OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
+
+    def fetch_once():
+        response = options_client.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
+        )
+        bid, ask = _validated_quote(response.get(symbol), symbol, max_age_seconds)
+        return SingleQuoteSnapshot(bid, ask)
+
+    return _retry_validated_quote_fetch(
+        fetch_once,
+        symbol,
+        attempts=validation_attempts,
+        retry_delay_seconds=validation_retry_delay_seconds,
     )
-    bid, ask = _validated_quote(response.get(symbol), symbol, max_age_seconds)
-    return SingleQuoteSnapshot(bid, ask)
 
 
 def _client_order_id(prefix, operation, attempt_number):

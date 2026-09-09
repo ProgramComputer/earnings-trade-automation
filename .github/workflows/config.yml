@@ -221,6 +221,7 @@ jobs:
           exit "${workflow_status}"
 
       - name: Sync optional Sheet outbox
+        id: sheet_sync
         if: always() && steps.market.outputs.run_mode == 'paper-trade'
         continue-on-error: true
         shell: bash
@@ -277,6 +278,40 @@ jobs:
           path: trades.db
           if-no-files-found: error
           retention-days: 30
+
+      - name: Report optional Sheet synchronization
+        if: always() && steps.market.outputs.run_mode == 'paper-trade' && hashFiles('trades.db') != ''
+        shell: bash
+        env:
+          SHEET_SYNC_OUTCOME: ${{ steps.sheet_sync.outcome }}
+        run: |
+          python - <<'PY'
+          import os, re, sqlite3
+          outcome = os.environ.get("SHEET_SYNC_OUTCOME", "unknown")
+          try:
+              with sqlite3.connect("file:trades.db?mode=ro", uri=True) as database:
+                  total, synced, pending = database.execute("""SELECT COUNT(*),
+                    COALESCE(SUM(state='synced'),0), COALESCE(SUM(state!='synced'),0)
+                    FROM sheet_outbox""").fetchone()
+                  row = database.execute("""SELECT last_error FROM sheet_outbox
+                    WHERE state!='synced' ORDER BY updated_at DESC LIMIT 1""").fetchone()
+              latest_error = "none" if not row else " ".join(str(row[0] or "not recorded").split())[:240]
+          except sqlite3.Error:
+              total = synced = pending = "unknown"
+              latest_error = "outbox status unavailable"
+
+          latest_error = re.sub(r"https?://\S+", "[URL REDACTED]", latest_error).replace("`", "'")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("### Optional Google Sheet synchronization\n\n")
+              output.write(f"- Command outcome: `{outcome}`\n")
+              output.write(f"- Outbox: {total} total, {synced} synced, {pending} pending\n")
+              output.write(f"- Latest pending error: `{latest_error}`\n")
+
+          if outcome != "success" or pending != 0:
+              warning = f"Sheet sync outcome={outcome}; {pending} event(s) remain queued. Latest error: {latest_error}"
+              warning = warning.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::warning title=Google Sheet synchronization::{warning}")
+          PY
 
       - name: Propagate trading failure
         if: always() && steps.trading.outcome == 'failure'

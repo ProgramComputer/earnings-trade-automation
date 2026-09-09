@@ -33,6 +33,10 @@ function doPost(e) {
     return jsonResponse_(false, 400, { error: "Request body is not valid JSON" });
   }
 
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return jsonResponse_(false, 400, { error: "Request body must be a JSON object" });
+  }
+
   var authError = authorizeRequest_(payload.auth_token);
   if (authError) {
     return jsonResponse_(false, authError.status, { error: authError.error });
@@ -64,12 +68,26 @@ function upsertRecord_(sheet, payload) {
   var recordId = normalizedId_(payload["Record ID"]);
   var tradeId = normalizedId_(payload["Trade ID"]);
   var syncType = String(payload["Sync Type"] || "").toLowerCase();
+  var validateSummary = false;
 
   if (!recordId && !tradeId) {
     return jsonResponse_(false, 400, { error: "Record ID or Trade ID is required" });
   }
   if (syncType === "fill" && !recordId) {
     return jsonResponse_(false, 400, { error: "Fill upserts require a unique Record ID" });
+  }
+  if (syncType === "fill") {
+    var missingFields = REQUIRED_FILL_HEADERS.filter(function(header) {
+      return !hasOwn_(payload, header);
+    });
+    if (missingFields.length) {
+      return jsonResponse_(false, 400, {
+        error: "Fill payload is incomplete", missing_payload_fields: missingFields
+      });
+    }
+    // Only an authenticated fill request upgrades the connected Sheet. No
+    // setup run, manual fill insertion, or second spreadsheet is needed.
+    validateSummary = ensureFillSchema_(sheet);
   }
 
   var lastColumn = sheet.getLastColumn();
@@ -162,6 +180,9 @@ function upsertRecord_(sheet, payload) {
   }
 
   SpreadsheetApp.flush();
+  if (validateSummary) {
+    validateFillSummary_(sheet, targetRow);
+  }
   return jsonResponse_(true, 200, {
     operation: operation,
     row: targetRow,
@@ -170,6 +191,140 @@ function upsertRecord_(sheet, payload) {
     written_headers: writeResult.writtenHeaders,
     ignored_formula_headers: writeResult.protectedHeaders
   });
+}
+
+function ensureFillSchema_(sheet) {
+  var lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) {
+    throw new Error("Sheet has no header row");
+  }
+  var headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(function(value) {
+    return String(value).trim();
+  });
+  var headerMap = buildHeaderMap_(headers);
+  REQUIRED_FILL_HEADERS.forEach(function(header) {
+    if (headers.indexOf(header) !== headers.lastIndexOf(header)) {
+      throw new Error("Duplicate required Sheet header: " + header);
+    }
+  });
+  var missing = REQUIRED_FILL_HEADERS.filter(function(header) {
+    return headerMap[header] === undefined;
+  });
+  var firstNewColumn = sheet.getMaxColumns() + 1;
+  missing.forEach(function(header, index) {
+    headerMap[header] = firstNewColumn + index - 1;
+  });
+
+  var legacyHeaders = [
+    "Result", "Ticker", "Implied Move", "Structure", "Side", "Size",
+    "Open Date", "Open Price", "Open Comm.", "Close Date", "Close Price",
+    "Close Comm.", "$ Return", "% Return on Premium", "Cumulative Return $"
+  ];
+  // Formula anchors can temporarily display an error. Recognize the layout
+  // from its input headers so retries cannot bypass summary validation.
+  var isLegacy = legacyHeaders.every(function(header, index) {
+    return index === 0 || index >= 12 || headers[index] === header;
+  });
+  if (!isLegacy && missing.length) {
+    throw new Error("Unrecognized Sheet layout; required fill headers must be configured before syncing");
+  }
+  var formulas = isLegacy ? fillSummaryFormulas_(headerMap) : {};
+  var originalFormulas = {
+    "A1": "=ARRAYFORMULA({\"Result\";IF(B2:B<>\"\",IF( ISNUMBER(M2:M),IF(M2:M>0,\"WIN\",\"LOSS\"),\"OPEN\"),\"\")})",
+    "M1": "=ARRAYFORMULA({\"$ Return\";\n  IF(\n    J2:J=\"\",\n    \"\",\n    F2:F * ((ABS(H2:H)-ABS(K2:K)) * 100)\n      * IF(E2:E=\"credit\", 1, -1)\n      - (I2:I + L2:L)\n  )}\n)",
+    "N1": "=ARRAYFORMULA({\"% Return on Premium\";\n  IF(\n    M2:M=\"\",\n    \"\",\n    M2:M\n      / ( H2:H * 100 * F2:F )\n  )}\n)"
+  };
+  // Check every formula before making any change. Only the known template or
+  // this migration's formulas are eligible; custom formulas are never replaced.
+  Object.keys(formulas).forEach(function(cell) {
+    var current = sheet.getRange(cell).getFormula();
+    if (compactFormula_(current) !== compactFormula_(originalFormulas[cell]) &&
+        compactFormula_(current) !== compactFormula_(formulas[cell])) {
+      throw new Error("Custom Sheet formula needs review before fill sync: " + cell);
+    }
+  });
+  var protectedColumns = findFormulaColumns_(sheet, Math.max(sheet.getLastRow(), 1), lastColumn);
+  REQUIRED_FILL_HEADERS.forEach(function(header) {
+    if (protectedColumns[headerMap[header]]) {
+      throw new Error("Required fill column is formula-managed: " + header);
+    }
+  });
+
+  if (isLegacy && compactFormula_(sheet.getRange("O1").getFormula()) !==
+      compactFormula_('=ARRAYFORMULA({"Cumulative Return $";IF(M2:M="","",SUMIF(ROW(M2:M),"<="&ROW(M2:M),M2:M))})')) {
+    throw new Error("Custom Sheet formula needs review before fill sync: O1");
+  }
+
+  if (missing.length) {
+    sheet.insertColumnsAfter(firstNewColumn - 1, missing.length);
+    var target = sheet.getRange(1, firstNewColumn, 1, missing.length);
+    target.setValues([missing]);
+    sheet.getRange(1, headerMap["Ticker"] + 1).copyFormatToRange(
+      sheet, firstNewColumn, firstNewColumn + missing.length - 1, 1, 1
+    );
+  }
+  (isLegacy ? ["M1", "N1", "A1"] : []).forEach(function(cell) {
+    var range = sheet.getRange(cell);
+    if (compactFormula_(range.getFormula()) !== compactFormula_(formulas[cell])) {
+      range.setFormula(formulas[cell]);
+    }
+  });
+  SpreadsheetApp.flush();
+  return isLegacy;
+}
+
+function validateFillSummary_(sheet, rowNumber) {
+  var columns = [0, 12, 13, 14];
+  var expected = ["Result", "$ Return", "% Return on Premium", "Cumulative Return $"];
+  var headers = sheet.getRange(1, 1, 1, 15).getDisplayValues()[0];
+  var values = sheet.getRange(rowNumber, 1, 1, 15).getDisplayValues()[0];
+  columns.forEach(function(column, index) {
+    if (headers[column] !== expected[index] ||
+        /^#(REF!|ERROR!|VALUE!|N\/A|DIV\/0!|NUM!|NAME\?)/.test(values[column])) {
+      throw new Error("Sheet summary formula needs repair before acknowledging row " + rowNumber);
+    }
+  });
+}
+
+function compactFormula_(formula) {
+  return String(formula).replace(/"(?:""|[^"])*"|\s+/g, function(value) {
+    return value.charAt(0) === '"' ? value : "";
+  });
+}
+
+function sheetColumn_(zeroBasedColumn) {
+  var result = "";
+  for (var value = zeroBasedColumn + 1; value > 0; value = Math.floor((value - 1) / 26)) {
+    result = String.fromCharCode(65 + (value - 1) % 26) + result;
+  }
+  return result;
+}
+
+function fillSummaryFormulas_(headerMap) {
+  var columns = {
+    "AF": "Record ID",
+    "AG": "Trade ID",
+    "AL": "Fill Phase",
+    "AN": "Filled Quantity",
+    "AO": "Remaining Quantity",
+    "AP": "Lifecycle Status",
+    "AS": "Open Cash Flow",
+    "AV": "Realized P&L"
+  };
+  // Legacy rows retain their calculation. Modern fills contribute one trade
+  // result only after all opening/closing quantities and close P&L are present.
+  // Unknown fees remain explicitly provisional in the P&L Status column.
+  var formulas = {
+    "A1": "=ARRAYFORMULA({\"Result\";IF(B2:B=\"\",\"\",IF(@AF@2:@AF@=\"\",IF(ISNUMBER(M2:M),IF(M2:M>0,\"WIN\",\"LOSS\"),\"OPEN\"),IF(ISNUMBER(M2:M),IF(M2:M>0,\"WIN\",\"LOSS\"),UPPER(@AL@2:@AL@)&\" FILL\")))})",
+    "M1": "={\"$ Return\";MAP(B2:B,@AF@2:@AF@,@AG@2:@AG@,@AL@2:@AL@,@AO@2:@AO@,@AP@2:@AP@,SEQUENCE(ROWS(B2:B),1,2),F2:F,E2:E,H2:H,I2:I,J2:J,K2:K,L2:L,LAMBDA(ticker,record,trade,phase,remaining,lifecycle,rownum,qty,side,entry,entryfee,exitdate,exitprice,exitfee,IF(ticker=\"\",\"\",IF(record=\"\",IF(exitdate=\"\",\"\",qty*((ABS(entry)-ABS(exitprice))*100)*IF(side=\"credit\",1,-1)-(entryfee+exitfee)),IF(AND(phase=\"close\",lifecycle=\"CLOSED\",remaining=0,trade<>\"\"),LET(openqty,SUMIFS(@AN@$2:@AN@,@AG@$2:@AG@,trade,@AL@$2:@AL@,\"open\"),closeqty,SUMIFS(@AN@$2:@AN@,@AG@$2:@AG@,trade,@AL@$2:@AL@,\"close\"),lastrow,MAX(FILTER(SEQUENCE(ROWS(@AG@$2:@AG@),1,2),@AG@$2:@AG@=trade,@AL@$2:@AL@=\"close\",@AP@$2:@AP@=\"CLOSED\",@AO@$2:@AO@=0)),closepnl,FILTER(@AV@$2:@AV@,@AG@$2:@AG@=trade,@AL@$2:@AL@=\"close\"),IF(AND(rownum=lastrow,openqty>0,openqty=closeqty,COUNT(closepnl)=ROWS(closepnl)),SUM(closepnl),\"\")),\"\")))))}",
+    "N1": "={\"% Return on Premium\";MAP(M2:M,@AF@2:@AF@,@AG@2:@AG@,H2:H,F2:F,LAMBDA(pnl,record,trade,entry,qty,IF(pnl=\"\",\"\",IF(record=\"\",pnl/(entry*100*qty),LET(premium,ABS(SUMIFS(@AS@$2:@AS@,@AG@$2:@AG@,trade,@AL@$2:@AL@,\"open\")),IF(premium=0,\"\",pnl/premium))))))}"
+  };
+  Object.keys(formulas).forEach(function(cell) {
+    formulas[cell] = formulas[cell].replace(/@([A-Z]+)@/g, function(token, key) {
+      return sheetColumn_(headerMap[columns[key]]);
+    });
+  });
+  return formulas;
 }
 
 function writePayload_(sheet, rowNumber, headers, protectedColumns, payload, keyHeader) {
@@ -284,6 +439,9 @@ function findEmptyDataRow_(sheet, lastRow, headerMap) {
     }
   }
 
+  if (lastRow < sheet.getMaxRows()) {
+    return lastRow + 1;
+  }
   sheet.insertRowsAfter(sheet.getMaxRows(), 1);
   return sheet.getMaxRows();
 }
