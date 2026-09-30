@@ -78,6 +78,8 @@ python automation.py
 - `reconcile-only`: The default manual mode; reconciles state and never submits orders.
 - `market-closed`: A neutral scheduled skip with no Python, synchronization, or database-persistence work.
 
+New entries are allowed from `ENTRY_WINDOW_MINUTES` before the close (default `240`, i.e. from noon on a regular session) until 3 minutes before the close, so a scheduled run that GitHub starts late can still trade. Set the repository variable `ENTRY_WINDOW_MINUTES` under **Settings > Secrets and variables > Actions > Variables** to change it; `25` restores the strategy's late-day entry.
+
 The included GitHub Actions workflow is explicitly configured for PAPER trading. A separate live application configuration must explicitly select live mode and the live Alpaca endpoint, use a non-default ledger path, and bind that ledger to the intended account.
 
 

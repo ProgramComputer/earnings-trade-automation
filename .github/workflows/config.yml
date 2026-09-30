@@ -38,6 +38,7 @@ jobs:
       GOOGLE_SCRIPT_URL: ${{ secrets.GOOGLE_SCRIPT_URL }}
       GOOGLE_SCRIPT_SECRET: ${{ secrets.GOOGLE_SCRIPT_SECRET }}
       MANUAL_MODE: ${{ inputs.mode }}
+      ENTRY_WINDOW_MINUTES: ${{ vars.ENTRY_WINDOW_MINUTES || '240' }}
 
     steps:
       - name: Checkout code
@@ -147,6 +148,10 @@ jobs:
         run: |
           set -euo pipefail
           clock_file="${RUNNER_TEMP}/alpaca-paper-entry-clock.json"
+          if [[ ! "${ENTRY_WINDOW_MINUTES}" =~ ^[0-9]+$ ]]; then
+            echo "::error::ENTRY_WINDOW_MINUTES must be a whole number of minutes."
+            exit 78
+          fi
 
           while true; do
             curl --silent --show-error --fail \
@@ -179,7 +184,7 @@ jobs:
             next_close="$(jq -r '.next_close' "${clock_file}")"
             broker_now_epoch="$(date --date="${broker_now}" +%s)"
             next_close_epoch="$(date --date="${next_close}" +%s)"
-            entry_epoch=$((next_close_epoch - 25 * 60))
+            entry_epoch=$((next_close_epoch - ENTRY_WINDOW_MINUTES * 60))
             cutoff_epoch=$((next_close_epoch - 3 * 60))
 
             if (( broker_now_epoch >= cutoff_epoch )); then
@@ -188,7 +193,7 @@ jobs:
             fi
 
             if (( broker_now_epoch >= entry_epoch )); then
-              echo "Alpaca PAPER clock confirms the 25-minute entry window is open."
+              echo "Alpaca PAPER clock confirms the ${ENTRY_WINDOW_MINUTES}-minute entry window is open."
               exit 0
             fi
 

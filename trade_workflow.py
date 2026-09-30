@@ -37,6 +37,10 @@ GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET")
 POSITION_ALLOCATION_PCT = Decimal(os.environ.get("POSITION_ALLOCATION_PCT", "0.06"))
 MAX_AGGREGATE_EXPOSURE_PCT = Decimal(os.environ.get("MAX_AGGREGATE_EXPOSURE_PCT", "0.20"))
+# Minutes before the broker close when new entries may start. The default
+# opens entries from noon on a regular session so a delayed scheduled run can
+# still trade; 25 restores the strategy's late-day entry.
+ENTRY_WINDOW_MINUTES = int(os.environ.get("ENTRY_WINDOW_MINUTES", "240"))
 UUID_NAMESPACE = uuid.UUID("f8eaa5b8-685f-4d83-9308-b426ad5f95a1")
 KNOWN_DEBITS = {"DG", "ORCL", "NKE"}
 KNOWN_SINGLE_CREDITS = {"CHPT", "LULU", "DRI", "KMX", "KR", "KMI"}
@@ -1102,7 +1106,7 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
 def is_time_to_open(earnings_date,when,market_close):
     now=datetime.now(EASTERN); close_at=market_close.astimezone(EASTERN)
     intended=close_at.date() if when=="BMO" else earnings_date
-    return close_at.date()==intended and close_at-timedelta(minutes=25)<=now<close_at-timedelta(minutes=3)
+    return close_at.date()==intended and close_at-timedelta(minutes=ENTRY_WINDOW_MINUTES)<=now<close_at-timedelta(minutes=3)
 
 
 def is_time_to_close(earnings_date,when):
@@ -1266,6 +1270,8 @@ def run_trade_workflow():
         raise OperationalFailure("Exposure percentages must be greater than zero and no more than one")
     if POSITION_ALLOCATION_PCT>MAX_AGGREGATE_EXPOSURE_PCT:
         raise OperationalFailure("Per-position allocation exceeds aggregate exposure cap")
+    if not 3<ENTRY_WINDOW_MINUTES<=390:
+        raise OperationalFailure("ENTRY_WINDOW_MINUTES must be greater than 3 and no more than 390")
     client,broker_mode=configured_broker_client()
     broker_identity=bind_or_validate_broker_identity(client,broker_mode,allow_bind=True)
     reconciliation=reconcile_broker_state(client,read_only=False,broker_mode=broker_mode,broker_identity=broker_identity)
@@ -1284,7 +1290,9 @@ def run_trade_workflow():
     next_open=getattr(clock,"next_open",None)
     if not isinstance(next_open,datetime): raise OperationalFailure("Broker clock did not provide the next session open")
     next_session_date=next_open.astimezone(EASTERN).date()
-    todays=get_todays_earnings(); tomorrows=get_tomorrows_earnings(next_open=next_open)
+    try: todays=get_todays_earnings(); tomorrows=get_tomorrows_earnings(next_open=next_open)
+    except RuntimeError as exc:
+        raise OperationalFailure(f"Earnings calendar unavailable; new openings skipped this run: {redact(exc)}") from exc
     if not isinstance(todays,list) or not isinstance(tomorrows,list): raise OperationalFailure("Earnings source returned invalid data")
     print(f"Earnings source returned {len(todays)} current-session and {len(tomorrows)} next-session records.")
     for item in tomorrows:

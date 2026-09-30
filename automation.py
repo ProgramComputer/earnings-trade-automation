@@ -35,12 +35,13 @@ GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 EASTERN = ZoneInfo("America/New_York")
 
 
-def get_json_with_retries(url, attempts=3):
+def get_json_with_retries(url, attempts=4):
     """Fetch JSON without allowing an upstream request to hang the workflow."""
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.get(url, timeout=(5, 20))
+            # DoltHub query responses can take longer than 20 seconds.
+            response = requests.get(url, timeout=(10, 45))
             response.raise_for_status()
             return response.json()
         except (requests.RequestException, ValueError) as error:
