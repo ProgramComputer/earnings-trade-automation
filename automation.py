@@ -416,6 +416,58 @@ def compute_recommendation(ticker):
         return f"Error: {e}"
         
 
+def fill_missing_timing(tickers, event_date, min_avg_volume=1500000, max_lookups=40):
+    """Fill a blank DoltHub `when` from Yahoo's earnings time for liquid symbols.
+
+    Only symbols that could pass the volume screen are looked up. A Yahoo time
+    before 9:30 ET means before the open and 16:00 ET or later means after the
+    close; midnight or intraday placeholders stay unknown and are skipped.
+    """
+    missing = [row for row in tickers if not row.get('when')]
+    if not missing:
+        return tickers
+    try:
+        symbols = sorted({row['act_symbol'] for row in missing})
+        history = yf.download(symbols, period='3mo', progress=False, auto_adjust=True,
+                              group_by='ticker', threads=True)
+        liquid = []
+        for symbol in symbols:
+            try:
+                volume = completed_daily_history(history[symbol])['Volume'].dropna()
+                if len(volume) >= 30 and volume.rolling(30).mean().iloc[-1] >= min_avg_volume:
+                    liquid.append(symbol)
+            except Exception:
+                continue
+        timing = {}
+        for symbol in liquid[:max_lookups]:
+            try:
+                dates = yf.Ticker(symbol).get_earnings_dates(limit=12)
+            except Exception as exc:
+                print(f"[{symbol}] Yahoo earnings timing unavailable: {exc}")
+                continue
+            if dates is None:
+                continue
+            for stamp in dates.index:
+                moment = pd.Timestamp(stamp)
+                moment = moment.tz_localize(EASTERN) if moment.tzinfo is None else moment.tz_convert(EASTERN)
+                if moment.date() != event_date:
+                    continue
+                minutes = moment.hour * 60 + moment.minute
+                if 0 < minutes < 9 * 60 + 30:
+                    timing[symbol] = 'Before market open'
+                elif minutes >= 16 * 60:
+                    timing[symbol] = 'After market close'
+                break
+        for row in missing:
+            when = timing.get(row['act_symbol'])
+            if when:
+                row['when'] = when
+                print(f"[{row['act_symbol']}] Earnings timing from Yahoo: {when.lower()}.")
+    except Exception as exc:
+        print(f"Yahoo earnings timing fallback skipped: {exc}")
+    return tickers
+
+
 def get_tomorrows_earnings(next_open=None):
     """Return earnings for Alpaca's next confirmed paper-market session."""
     if next_open is None:
@@ -436,10 +488,11 @@ def get_tomorrows_earnings(next_open=None):
         {'act_symbol': row['act_symbol'], 'when': row.get('when')}
         for row in data.get('rows', []) if 'act_symbol' in row
     ]
-    return tickers
+    return fill_missing_timing(tickers, next_open_date)
 
 def get_todays_earnings():
-    today = datetime.now(EASTERN).strftime('%Y-%m-%d')
+    today_date = datetime.now(EASTERN).date()
+    today = today_date.strftime('%Y-%m-%d')
     base_url = "https://www.dolthub.com/api/v1alpha1/post-no-preference/earnings/master"
     query = f"SELECT * FROM `earnings_calendar` where date = '{today}' ORDER BY `act_symbol` ASC, `date` ASC LIMIT 1000;"
     url = f"{base_url}?q={urllib.parse.quote(query)}"
@@ -449,7 +502,7 @@ def get_todays_earnings():
         {'act_symbol': row['act_symbol'], 'when': row.get('when')}
         for row in data.get('rows', []) if 'act_symbol' in row
     ]
-    return tickers
+    return fill_missing_timing(tickers, today_date)
 
 def main():
     parser = argparse.ArgumentParser()

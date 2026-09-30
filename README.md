@@ -4,7 +4,7 @@ Automated trading bot for executing earnings calendar spread strategies using op
 
 ## Features
 - **Automated Earnings Calendar Spread Trading**: Opens and closes calendar spreads around earnings events based on strict screening criteria.
-- **Kelly Criterion Position Sizing**: Uses a 10% Kelly fraction for optimal, risk-managed position sizing.
+- **Fixed-Fraction Position Sizing**: Allocates 6% of account equity per trade, with a cap on total open exposure.
 - **Optional Google Sheets Integration**: Queues trade updates in SQLite and syncs them separately through Apps Script.
 - **Alpaca API Integration**: Places and closes trades automatically using Alpaca brokerage API.
 - **Configurable and Extensible**: Modular codebase for easy strategy tweaks and integration.
@@ -18,7 +18,7 @@ We implement an earnings volatility selling strategy focusing on calendar spread
   - **Term Structure Slope**: Negative slope between front-month and 45-day expirations (backwardation).
   - **30-Day Average Volume**: Ensures sufficient liquidity and price-insensitive demand.
   - **IV/RV Ratio**: High implied-to-realized volatility ratio indicates overpriced options; realized volatility is estimated using the 30-day Yang–Zhang estimator.
-- Position Sizing: Apply a 10% Kelly fraction for optimal, risk-managed sizing.
+- Position Sizing: Allocate a fixed 6% of account equity per trade (`POSITION_ALLOCATION_PCT`) and cap total open exposure at 36% (`MAX_AGGREGATE_EXPOSURE_PCT`), which allows about six new positions per session.
 
 ## Quick Start
 
@@ -78,14 +78,41 @@ python automation.py
 - `reconcile-only`: The default manual mode; reconciles state and never submits orders.
 - `market-closed`: A neutral scheduled skip with no Python, synchronization, or database-persistence work.
 
-New entries are allowed from `ENTRY_WINDOW_MINUTES` before the close (default `240`, i.e. from noon on a regular session) until 3 minutes before the close, so a scheduled run that GitHub starts late can still trade. Set the repository variable `ENTRY_WINDOW_MINUTES` under **Settings > Secrets and variables > Actions > Variables** to change it; `25` restores the strategy's late-day entry.
+#### Settings
+Set these as repository variables under **Settings > Secrets and variables > Actions > Variables**. Leave one unset to use its default.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ENTRY_WINDOW_MINUTES` | `240` | New entries may start this many minutes before the close (from noon on a regular session) and stop 3 minutes before it, so a run GitHub starts late can still trade. `25` restores the strategy's late-day entry. |
+| `QUOTE_MAX_AGE_SECONDS` | `120` | Oldest option quote accepted for pricing an order. Thinly traded contracts often keep an unchanged quote for more than 30 seconds. |
+| `OPEN_MAX_DEBIT_SPREAD_FRACTION` | `1` | How far from the spread's midpoint toward its ask an opening order may go. Orders start at the midpoint and step up; Alpaca PAPER has not filled spreads below the ask. |
+| `POSITION_ALLOCATION_PCT` | `0.06` | Share of equity allocated to each new position. |
+| `MAX_AGGREGATE_EXPOSURE_PCT` | `0.36` | Cap on total open exposure as a share of equity. |
+
+Earnings calendar rows with no before/after-market time are looked up on Yahoo Finance when the stock's 30-day average volume passes the screen; rows Yahoo cannot place stay skipped.
+
+#### On-Time Runs With an External Scheduler
+GitHub can start scheduled runs hours late, which delays exits past 9:40 ET. Runs started through `workflow_dispatch` are not held in the scheduled-run queue, so an external scheduler gives on-time exits:
+
+1. Create a fine-grained personal access token for this repository only, with **Actions: Read and write** permission.
+2. In any cron service, schedule a weekday request at 9:45 ET (and, for late-day entries, at 15:36 ET):
+
+```
+POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/config.yml/dispatches
+Authorization: Bearer <token>
+Accept: application/vnd.github+json
+
+{"ref": "main", "inputs": {"mode": "paper-trade"}}
+```
+
+Dispatched `paper-trade` runs follow the same rules as scheduled ones: exits from 9:40 ET, entries only inside the entry window, and a neutral skip when the market is closed. The existing schedule stays in place as a fallback.
 
 The included GitHub Actions workflow is explicitly configured for PAPER trading. A separate live application configuration must explicitly select live mode and the live Alpaca endpoint, use a non-default ledger path, and bind that ledger to the intended account.
 
 
 ## Example Workflow
 - **Screen for Earnings**: Bot fetches tomorrow's earnings tickers.
-- **Screening & Sizing**: For each ticker, applies IV/volume/slope criteria and calculates position size using Kelly.
+- **Screening & Sizing**: For each ticker, applies IV/volume/slope criteria and sizes the position from the per-trade allocation and exposure cap.
 - **Open Trades**: Places calendar spread trades at the correct time (BMO/AMC logic).
 - **Track & Close**: Monitors open trades and closes them at the correct time, with optional Sheet updates delivered from the SQLite outbox.
 

@@ -158,12 +158,12 @@ class CloseIsolationTests(unittest.TestCase):
             ) as record_failure,
             patch.object(trade_workflow, "finalize_execution") as finalize,
         ):
-            with self.assertRaisesRegex(
-                trade_workflow.OperationalFailure,
-                "1 due trade close.*remain unresolved",
-            ):
-                trade_workflow.close_due_trades(object(), resolution, 10_000)
+            failures = trade_workflow.close_due_trades(object(), resolution, 10_000)
 
+        self.assertEqual(
+            failures,
+            ["trade=trade-bad CLOSE_QUOTE_VALIDATION_FAILED: still stale"],
+        )
         self.assertEqual(close_order.call_count, 2)
         record_failure.assert_called_once()
         self.assertEqual(record_failure.call_args.args[0], "trade-bad")

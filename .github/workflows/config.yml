@@ -39,6 +39,11 @@ jobs:
       GOOGLE_SCRIPT_SECRET: ${{ secrets.GOOGLE_SCRIPT_SECRET }}
       MANUAL_MODE: ${{ inputs.mode }}
       ENTRY_WINDOW_MINUTES: ${{ vars.ENTRY_WINDOW_MINUTES || '240' }}
+      # Unset repository variables arrive empty, and the code applies its defaults.
+      QUOTE_MAX_AGE_SECONDS: ${{ vars.QUOTE_MAX_AGE_SECONDS }}
+      OPEN_MAX_DEBIT_SPREAD_FRACTION: ${{ vars.OPEN_MAX_DEBIT_SPREAD_FRACTION }}
+      POSITION_ALLOCATION_PCT: ${{ vars.POSITION_ALLOCATION_PCT }}
+      MAX_AGGREGATE_EXPOSURE_PCT: ${{ vars.MAX_AGGREGATE_EXPOSURE_PCT }}
 
     steps:
       - name: Checkout code

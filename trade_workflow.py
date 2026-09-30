@@ -22,7 +22,7 @@ from alpaca.trading.enums import PositionIntent
 
 from automation import compute_recommendation, get_todays_earnings, get_tomorrows_earnings
 from alpaca_integration import (
-    QuoteValidationError,
+    DEFAULT_QUOTE_MAX_AGE_SECONDS, QuoteValidationError,
     close_calendar_spread_order, close_single_option_leg_order,
     get_alpaca_option_chain, get_spread_quotes, init_alpaca_client,
     place_calendar_spread_order, select_expiries_and_strike_alpaca,
@@ -35,12 +35,17 @@ TRADES_DB_PATH_SETTING = os.environ.get("TRADES_DB_PATH")
 DB_PATH = Path(TRADES_DB_PATH_SETTING.strip()).expanduser() if TRADES_DB_PATH_SETTING and TRADES_DB_PATH_SETTING.strip() else DEFAULT_DB_PATH
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET")
-POSITION_ALLOCATION_PCT = Decimal(os.environ.get("POSITION_ALLOCATION_PCT", "0.06"))
-MAX_AGGREGATE_EXPOSURE_PCT = Decimal(os.environ.get("MAX_AGGREGATE_EXPOSURE_PCT", "0.20"))
+POSITION_ALLOCATION_PCT = Decimal(os.environ.get("POSITION_ALLOCATION_PCT") or "0.06")
+# Positions last about a day, so this caps how many can open in one session.
+MAX_AGGREGATE_EXPOSURE_PCT = Decimal(os.environ.get("MAX_AGGREGATE_EXPOSURE_PCT") or "0.36")
 # Minutes before the broker close when new entries may start. The default
 # opens entries from noon on a regular session so a delayed scheduled run can
 # still trade; 25 restores the strategy's late-day entry.
-ENTRY_WINDOW_MINUTES = int(os.environ.get("ENTRY_WINDOW_MINUTES", "240"))
+ENTRY_WINDOW_MINUTES = int(os.environ.get("ENTRY_WINDOW_MINUTES") or "240")
+# Share of the distance from the net midpoint to the net ask that an opening
+# order may pay. The chase still starts at the midpoint; 1 allows the natural
+# price, and Alpaca PAPER has not filled spreads below it.
+OPEN_MAX_DEBIT_SPREAD_FRACTION = Decimal(os.environ.get("OPEN_MAX_DEBIT_SPREAD_FRACTION") or "1")
 UUID_NAMESPACE = uuid.UUID("f8eaa5b8-685f-4d83-9308-b426ad5f95a1")
 KNOWN_DEBITS = {"DG", "ORCL", "NKE"}
 KNOWN_SINGLE_CREDITS = {"CHPT", "LULU", "DRI", "KMX", "KR", "KMI"}
@@ -1148,6 +1153,7 @@ def record_close_quote_failure(trade_id, error):
 
 
 def close_due_trades(client,reconciliation,run_deadline):
+    """Close due positions and return the trades whose close quotes stayed invalid."""
     failures=[]
     for trade in get_open_trades():
         if time_module.monotonic()+60>=run_deadline:
@@ -1186,11 +1192,18 @@ def close_due_trades(client,reconciliation,run_deadline):
             continue
         finalize_execution(tid,result)
         print(f"Close result trade={tid} method={method} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}")
-    if failures:
-        raise OperationalFailure(
-            f"{len(failures)} due trade close(s) remain unresolved after quote validation retries: "
-            + "; ".join(failures)
-        )
+    return failures
+
+
+def release_unfilled_open_plan(trade_id, reason):
+    """Mark an opening plan retryable when it has no fill and no live broker order."""
+    with db(write=True) as conn:
+        row=conn.execute("SELECT filled_quantity FROM trades WHERE trade_id=?",(trade_id,)).fetchone()
+        active=conn.execute("SELECT 1 FROM broker_orders WHERE trade_id=? AND phase='open' AND terminal=0 LIMIT 1",(trade_id,)).fetchone()
+        if not row or int(row["filled_quantity"] or 0)>0 or active:
+            return False
+        conn.execute("UPDATE trades SET lifecycle_status='CANCELED_NO_FILL',reconciliation_status=?,updated_at=? WHERE trade_id=?",(reason,stamp(),trade_id))
+    return True
 
 
 def candidate_allocation(client,spread_cost):
@@ -1218,7 +1231,8 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
     if not short_expiry or not long_expiry or strike is None:
         print(f"Skipping {ticker}: expiries or strike unavailable"); return
     chain=get_alpaca_option_chain(ticker)
-    if not chain: raise OperationalFailure(f"Option chain unavailable for {ticker}")
+    if not chain:
+        print(f"Skipping {ticker}: option chain unavailable"); return
     short_contract=chain.get(short_expiry,{}).get(strike,{}).get("call")
     long_contract=chain.get(long_expiry,{}).get(strike,{}).get("call")
     short_symbol=getattr(short_contract,"symbol",None); long_symbol=getattr(long_contract,"symbol",None)
@@ -1227,14 +1241,15 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
     try:
         short_bid,short_ask,long_bid,long_ask=(dec(value) for value in get_spread_quotes(short_symbol,long_symbol))
     except Exception as exc:
-        raise OperationalFailure(f"Validated option quotes unavailable for {ticker}: {redact(exc)}") from exc
+        print(f"Skipping {ticker}: validated option quotes unavailable: {redact(exc)}"); return
     net_bid=long_bid-short_ask; net_ask=long_ask-short_bid
     if net_ask<=0 or net_bid>net_ask:
         print(f"Skipping {ticker}: invalid net spread market bid={net_bid} ask={net_ask}"); return
     midpoint=((net_bid+net_ask)/2).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
     if midpoint<=0: midpoint=Decimal("0.01")
     slippage=Decimal(os.environ.get("OPEN_MAX_DEBIT_SLIPPAGE", "0.05"))
-    target_debit=min(net_ask,midpoint+max(slippage,Decimal(0))).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+    allowance=max(slippage,OPEN_MAX_DEBIT_SPREAD_FRACTION*(net_ask-midpoint),Decimal(0))
+    target_debit=min(net_ask,midpoint+allowance).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
     if target_debit<=0:
         print(f"Skipping {ticker}: no positive hard debit ceiling"); return
     quantity,allocation,existing,cap=candidate_allocation(client,target_debit)
@@ -1248,13 +1263,18 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
     print(f"Trade plan {trade_id}: {plan_status} with ordered quantity {quantity}.")
     prefix=reserve_operation_prefix(trade_id,"open","calendar_spread")
     operation_deadline=min(time_module.monotonic()+180,run_deadline)
-    result=place_calendar_spread_order(short_symbol,long_symbol,quantity,limit_price=midpoint,
-      target_debit_price=target_debit,max_total_cost_allowed=Decimal(allocation)/100,
-      on_terminal=lambda event,tid=trade_id:record_fill(tid,"open","calendar_spread",event),
-      on_order_state=lambda event,tid=trade_id:persist_unpriced_order_state(tid,"open","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
-      on_submitted=lambda order,context,tid=trade_id:upsert_submitted_order(tid,"open","calendar_spread",order,{**context,"submission_only":True}),
-      before_submit=before_submit_guard(allocation,opening=True,deadline=operation_deadline),max_attempts=8,overall_timeout=180,attempt_timeout=30,cancel_timeout=30,
-      client_order_id_prefix=prefix)
+    try:
+        result=place_calendar_spread_order(short_symbol,long_symbol,quantity,limit_price=midpoint,
+          target_debit_price=target_debit,max_total_cost_allowed=Decimal(allocation)/100,
+          on_terminal=lambda event,tid=trade_id:record_fill(tid,"open","calendar_spread",event),
+          on_order_state=lambda event,tid=trade_id:persist_unpriced_order_state(tid,"open","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
+          on_submitted=lambda order,context,tid=trade_id:upsert_submitted_order(tid,"open","calendar_spread",order,{**context,"submission_only":True}),
+          before_submit=before_submit_guard(allocation,opening=True,deadline=operation_deadline),max_attempts=8,overall_timeout=180,attempt_timeout=30,cancel_timeout=30,
+          client_order_id_prefix=prefix)
+    except QuoteValidationError as exc:
+        # Only a plan with no fill and no live order is safe to leave behind.
+        if not release_unfilled_open_plan(trade_id,"open_quote_validation_failed"): raise
+        print(f"Skipping {ticker}: opening quotes became invalid before any fill: {redact(exc)}"); return
     finalize_execution(trade_id,result)
     if int(dec(getattr(result,"filled_qty",0) or 0))==0: mark_no_fill(trade_id,result)
     print(f"Open result trade={trade_id} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',quantity)} stop_reason={getattr(result,'stop_reason','')}")
@@ -1272,6 +1292,10 @@ def run_trade_workflow():
         raise OperationalFailure("Per-position allocation exceeds aggregate exposure cap")
     if not 3<ENTRY_WINDOW_MINUTES<=390:
         raise OperationalFailure("ENTRY_WINDOW_MINUTES must be greater than 3 and no more than 390")
+    if not Decimal(0)<=OPEN_MAX_DEBIT_SPREAD_FRACTION<=Decimal(1):
+        raise OperationalFailure("OPEN_MAX_DEBIT_SPREAD_FRACTION must be between zero and one")
+    if not 0<DEFAULT_QUOTE_MAX_AGE_SECONDS<=900:
+        raise OperationalFailure("QUOTE_MAX_AGE_SECONDS must be greater than zero and no more than 900")
     client,broker_mode=configured_broker_client()
     broker_identity=bind_or_validate_broker_identity(client,broker_mode,allow_bind=True)
     reconciliation=reconcile_broker_state(client,read_only=False,broker_mode=broker_mode,broker_identity=broker_identity)
@@ -1279,14 +1303,26 @@ def run_trade_workflow():
     except Exception as exc: raise OperationalFailure(f"Unable to fetch broker market clock: {redact(exc)}") from exc
     if not bool(getattr(clock,"is_open",False)):
         print(f"Market closed; neutral skip. Next open: {getattr(clock,'next_open','unknown')}"); return 0
-    close_due_trades(client,reconciliation,run_deadline)
+    # A close stuck on invalid quotes is reported after entries rather than
+    # blocking them; the stuck position still counts toward the exposure cap.
+    close_failures=close_due_trades(client,reconciliation,run_deadline)
+    open_new_positions(client,clock,run_deadline)
+    if close_failures:
+        raise OperationalFailure(
+            f"{len(close_failures)} due trade close(s) remain unresolved after quote validation retries: "
+            + "; ".join(close_failures)
+        )
+    return 0
+
+
+def open_new_positions(client,clock,run_deadline):
     now=datetime.now(EASTERN)
     if now.time()<time(12):
-        print("Morning position-management run complete; new openings skipped."); return 0
+        print("Morning position-management run complete; new openings skipped."); return
     market_close=getattr(clock,"next_close",None)
     if not isinstance(market_close,datetime): raise OperationalFailure("Broker clock did not provide this session's close")
     if now>=market_close.astimezone(EASTERN)-timedelta(minutes=3):
-        print("PAPER entry cutoff reached; reconciliation and position management complete; new openings skipped."); return 0
+        print("PAPER entry cutoff reached; reconciliation and position management complete; new openings skipped."); return
     next_open=getattr(clock,"next_open",None)
     if not isinstance(next_open,datetime): raise OperationalFailure("Broker clock did not provide the next session open")
     next_session_date=next_open.astimezone(EASTERN).date()
@@ -1301,7 +1337,6 @@ def run_trade_workflow():
     for item in todays:
         if "after" in str(item.get("when") or "").lower(): open_candidate(client,item,"AMC",now.date(),market_close,run_deadline)
         elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: current-session record is not AMC.")
-    return 0
 
 
 def run_reconcile_only():
