@@ -35,6 +35,7 @@ TRADES_DB_PATH_SETTING = os.environ.get("TRADES_DB_PATH")
 DB_PATH = Path(TRADES_DB_PATH_SETTING.strip()).expanduser() if TRADES_DB_PATH_SETTING and TRADES_DB_PATH_SETTING.strip() else DEFAULT_DB_PATH
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET")
+# Kelly allocation per position as a share of equity (formerly kelly_fraction).
 POSITION_ALLOCATION_PCT = Decimal(os.environ.get("POSITION_ALLOCATION_PCT") or "0.06")
 # Positions last about a day, so this caps how many can open in one session.
 MAX_AGGREGATE_EXPOSURE_PCT = Decimal(os.environ.get("MAX_AGGREGATE_EXPOSURE_PCT") or "0.36")
