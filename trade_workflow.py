@@ -35,8 +35,15 @@ TRADES_DB_PATH_SETTING = os.environ.get("TRADES_DB_PATH")
 DB_PATH = Path(TRADES_DB_PATH_SETTING.strip()).expanduser() if TRADES_DB_PATH_SETTING and TRADES_DB_PATH_SETTING.strip() else DEFAULT_DB_PATH
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET")
-# Kelly allocation per position as a share of equity (formerly kelly_fraction).
+# Fixed allocation per position as a share of equity (formerly kelly_fraction),
+# used until the Kelly inputs below are configured.
 POSITION_ALLOCATION_PCT = Decimal(os.environ.get("POSITION_ALLOCATION_PCT") or "0.06")
+# Kelly sizing: the share of full Kelly to bet, and the strategy's expected win
+# rate plus its average win and average loss as fractions of the debit paid.
+KELLY_FRACTION = os.environ.get("KELLY_FRACTION") or "0.10"
+KELLY_WIN_RATE = os.environ.get("KELLY_WIN_RATE")
+KELLY_AVG_WIN = os.environ.get("KELLY_AVG_WIN")
+KELLY_AVG_LOSS = os.environ.get("KELLY_AVG_LOSS")
 # Positions last about a day, so this caps how many can open in one session.
 MAX_AGGREGATE_EXPOSURE_PCT = Decimal(os.environ.get("MAX_AGGREGATE_EXPOSURE_PCT") or "0.36")
 # Minutes before the broker close when new entries may start. The default
@@ -1207,10 +1214,34 @@ def release_unfilled_open_plan(trade_id, reason):
     return True
 
 
+def position_allocation():
+    """Return the per-position share of equity and a description of its basis."""
+    inputs={"KELLY_WIN_RATE":KELLY_WIN_RATE,"KELLY_AVG_WIN":KELLY_AVG_WIN,"KELLY_AVG_LOSS":KELLY_AVG_LOSS}
+    if not any(inputs.values()):
+        return POSITION_ALLOCATION_PCT,(f"fixed {POSITION_ALLOCATION_PCT} of equity; set KELLY_WIN_RATE, "
+                                        "KELLY_AVG_WIN and KELLY_AVG_LOSS to size by Kelly")
+    missing=[name for name,value in inputs.items() if not value]
+    if missing:
+        raise OperationalFailure(f"Kelly sizing also needs {', '.join(missing)}")
+    try:
+        win_rate,avg_win,avg_loss,fraction=(Decimal(value) for value in (KELLY_WIN_RATE,KELLY_AVG_WIN,KELLY_AVG_LOSS,KELLY_FRACTION))
+    except InvalidOperation as exc:
+        raise OperationalFailure("Kelly sizing inputs must be decimal numbers") from exc
+    if not all(value.is_finite() for value in (win_rate,avg_win,avg_loss,fraction)) or not (
+        Decimal(0)<win_rate<Decimal(1) and avg_win>0 and avg_loss>0 and Decimal(0)<fraction<=Decimal(1)
+    ):
+        raise OperationalFailure("Kelly sizing needs 0 < KELLY_WIN_RATE < 1, a positive KELLY_AVG_WIN and "
+                                 "KELLY_AVG_LOSS, and 0 < KELLY_FRACTION <= 1")
+    # Kelly: K = W - (1 - W) / R, where R is the average win over the average loss.
+    full_kelly=win_rate-(1-win_rate)*avg_loss/avg_win
+    allocation=max(full_kelly,Decimal(0))*fraction
+    return allocation,f"{fraction} x full Kelly {full_kelly:.4f} = {allocation:.4f} of equity"
+
+
 def candidate_allocation(client,spread_cost):
     equity,buying=account_snapshot(client); existing=exposure_cents()
     cap=dollars_to_cents(equity*MAX_AGGREGATE_EXPOSURE_PCT)
-    per_position=dollars_to_cents(equity*POSITION_ALLOCATION_PCT)
+    per_position=dollars_to_cents(equity*position_allocation()[0])
     allocation=min(per_position,max(0,cap-existing),dollars_to_cents(buying))
     cost=abs(contract_cashflow_cents(spread_cost,1))
     return (allocation//cost if cost else 0),allocation,existing,cap
@@ -1289,8 +1320,10 @@ def run_trade_workflow():
     run_deadline=time_module.monotonic()+35*60
     if not Decimal(0)<POSITION_ALLOCATION_PCT<=Decimal(1) or not Decimal(0)<MAX_AGGREGATE_EXPOSURE_PCT<=Decimal(1):
         raise OperationalFailure("Exposure percentages must be greater than zero and no more than one")
-    if POSITION_ALLOCATION_PCT>MAX_AGGREGATE_EXPOSURE_PCT:
+    allocation_pct,sizing_basis=position_allocation()
+    if allocation_pct>MAX_AGGREGATE_EXPOSURE_PCT:
         raise OperationalFailure("Per-position allocation exceeds aggregate exposure cap")
+    print(f"Position sizing: {sizing_basis}.")
     if not 3<ENTRY_WINDOW_MINUTES<=390:
         raise OperationalFailure("ENTRY_WINDOW_MINUTES must be greater than 3 and no more than 390")
     if not Decimal(0)<=OPEN_MAX_DEBIT_SPREAD_FRACTION<=Decimal(1):
@@ -1324,6 +1357,9 @@ def open_new_positions(client,clock,run_deadline):
     if not isinstance(market_close,datetime): raise OperationalFailure("Broker clock did not provide this session's close")
     if now>=market_close.astimezone(EASTERN)-timedelta(minutes=3):
         print("PAPER entry cutoff reached; reconciliation and position management complete; new openings skipped."); return
+    allocation_pct,sizing_basis=position_allocation()
+    if allocation_pct<=0:
+        print(f"Position sizing allows no new positions ({sizing_basis}); new openings skipped."); return
     next_open=getattr(clock,"next_open",None)
     if not isinstance(next_open,datetime): raise OperationalFailure("Broker clock did not provide the next session open")
     next_session_date=next_open.astimezone(EASTERN).date()

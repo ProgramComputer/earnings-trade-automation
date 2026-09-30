@@ -269,6 +269,78 @@ class MissingTimingFallbackTests(unittest.TestCase):
         self.assertEqual(result, [{"act_symbol": "EARLY", "when": None}])
 
 
+def kelly_inputs(win_rate=None, avg_win=None, avg_loss=None, fraction="0.10"):
+    stack = ExitStack()
+    for name, value in (
+        ("KELLY_WIN_RATE", win_rate),
+        ("KELLY_AVG_WIN", avg_win),
+        ("KELLY_AVG_LOSS", avg_loss),
+        ("KELLY_FRACTION", fraction),
+    ):
+        stack.enter_context(patch.object(trade_workflow, name, value))
+    return stack
+
+
+class KellySizingTests(unittest.TestCase):
+    def test_fixed_allocation_is_used_until_kelly_inputs_are_set(self):
+        with kelly_inputs():
+            allocation, basis = trade_workflow.position_allocation()
+        self.assertEqual(allocation, trade_workflow.POSITION_ALLOCATION_PCT)
+        self.assertIn("fixed", basis)
+
+    def test_allocation_is_the_configured_fraction_of_full_kelly(self):
+        with kelly_inputs("0.60", "0.40", "0.30"):
+            allocation, basis = trade_workflow.position_allocation()
+        self.assertEqual(allocation, Decimal("0.030"))
+        self.assertIn("full Kelly 0.3000", basis)
+
+    def test_negative_edge_allocates_nothing(self):
+        # The 2025 sheet: 17% wins, +113% average win, -59% average loss.
+        with kelly_inputs("0.17", "1.13", "0.59"):
+            allocation, _basis = trade_workflow.position_allocation()
+        self.assertEqual(allocation, 0)
+
+    def test_partial_or_invalid_inputs_are_refused(self):
+        for inputs, message in (
+            (("0.60", None, "0.30"), "KELLY_AVG_WIN"),
+            (("1.5", "0.40", "0.30"), "0 < KELLY_WIN_RATE < 1"),
+            (("0.60", "abc", "0.30"), "decimal numbers"),
+            (("0.60", "0.40", "NaN"), "0 < KELLY_WIN_RATE < 1"),
+        ):
+            with self.subTest(inputs=inputs), kelly_inputs(*inputs):
+                with self.assertRaisesRegex(trade_workflow.OperationalFailure, message):
+                    trade_workflow.position_allocation()
+
+    def test_candidate_quantity_uses_the_kelly_allocation(self):
+        with (
+            kelly_inputs("0.60", "0.40", "0.30"),
+            patch.object(trade_workflow, "account_snapshot", return_value=(Decimal("100000"), Decimal("100000"))),
+            patch.object(trade_workflow, "exposure_cents", return_value=0),
+        ):
+            quantity, allocation, _existing, _cap = trade_workflow.candidate_allocation(object(), Decimal("0.50"))
+        self.assertEqual(allocation, 300_000)
+        self.assertEqual(quantity, 60)
+
+    def test_no_edge_skips_openings_before_fetching_earnings(self):
+        class Afternoon(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 9, 30, 13, 10, tzinfo=EASTERN)
+
+        # Broker times are built from the patched class the workflow type-checks against.
+        clock = SimpleNamespace(
+            next_close=Afternoon(2026, 9, 30, 16, 0, tzinfo=EASTERN),
+            next_open=Afternoon(2026, 10, 1, 9, 30, tzinfo=EASTERN),
+        )
+        with (
+            kelly_inputs("0.17", "1.13", "0.59"),
+            patch.object(trade_workflow, "datetime", Afternoon),
+            patch.object(trade_workflow, "get_todays_earnings") as todays,
+        ):
+            trade_workflow.open_new_positions(object(), clock, 10_000)
+        todays.assert_not_called()
+
+
 class QuoteAgeTests(unittest.TestCase):
     def test_default_quote_age_accepts_a_quiet_thirty_five_second_quote(self):
         quote = SimpleNamespace(
