@@ -360,7 +360,13 @@ def _quote_timestamp(value, symbol):
     return parsed.astimezone(timezone.utc)
 
 
-def _validated_quote(quote, symbol, max_age_seconds):
+def _validated_quote(quote, symbol, max_age_seconds, *, allow_empty_bid=False):
+    """Validate one option quote.
+
+    ``allow_empty_bid`` accepts a market with no bid at all (zero price and zero
+    size), which is normal for a nearly worthless option. Only a leg the order
+    buys may use it; a leg being sold still needs a real bid.
+    """
     if quote is None:
         raise QuoteValidationError(f"Missing quote for {symbol}.")
     try:
@@ -379,6 +385,8 @@ def _validated_quote(quote, symbol, max_age_seconds):
                 valid_size = _decimal(size, f"{symbol} {size_name}")
             except ValueError as exc:
                 raise QuoteValidationError(str(exc)) from exc
+            if allow_empty_bid and size_name == "bid_size" and bid == 0 and valid_size == 0:
+                continue
             if valid_size <= 0:
                 raise QuoteValidationError(f"Quote for {symbol} has zero {size_name}.")
     quote_time = _quote_timestamp(getattr(quote, "timestamp", None), symbol)
@@ -419,6 +427,7 @@ def _fetch_spread_quote_snapshot(
     long_symbol,
     max_age_seconds,
     *,
+    allow_empty_short_bid=False,
     validation_attempts=DEFAULT_QUOTE_FETCH_ATTEMPTS,
     validation_retry_delay_seconds=DEFAULT_QUOTE_RETRY_DELAY_SECONDS,
 ):
@@ -433,7 +442,8 @@ def _fetch_spread_quote_snapshot(
             OptionLatestQuoteRequest(symbol_or_symbols=[short_symbol, long_symbol])
         )
         short_bid, short_ask = _validated_quote(
-            response.get(short_symbol), short_symbol, max_age_seconds
+            response.get(short_symbol), short_symbol, max_age_seconds,
+            allow_empty_bid=allow_empty_short_bid,
         )
         long_bid, long_ask = _validated_quote(
             response.get(long_symbol), long_symbol, max_age_seconds
@@ -452,6 +462,7 @@ def _fetch_single_quote_snapshot(
     symbol,
     max_age_seconds,
     *,
+    allow_empty_bid=False,
     validation_attempts=DEFAULT_QUOTE_FETCH_ATTEMPTS,
     validation_retry_delay_seconds=DEFAULT_QUOTE_RETRY_DELAY_SECONDS,
 ):
@@ -465,7 +476,9 @@ def _fetch_single_quote_snapshot(
         response = options_client.get_option_latest_quote(
             OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
         )
-        bid, ask = _validated_quote(response.get(symbol), symbol, max_age_seconds)
+        bid, ask = _validated_quote(
+            response.get(symbol), symbol, max_age_seconds, allow_empty_bid=allow_empty_bid
+        )
         return SingleQuoteSnapshot(bid, ask)
 
     return _retry_validated_quote_fetch(
@@ -1026,8 +1039,9 @@ def close_calendar_spread_order(
             stop_reason = "overall_deadline_reached"
             break
 
+        # Closing buys the short leg back, so it may have no bid once worthless.
         quotes = _fetch_spread_quote_snapshot(
-            short_symbol, long_symbol, quote_max_age_seconds
+            short_symbol, long_symbol, quote_max_age_seconds, allow_empty_short_bid=True
         )
         signed_bid = quotes.closing_signed_bid
         signed_ask = quotes.closing_signed_ask
@@ -1760,7 +1774,9 @@ def close_single_option_leg_order(
             stop_reason = "overall_deadline_reached"
             break
 
-        quote = _fetch_single_quote_snapshot(symbol, quote_max_age_seconds)
+        quote = _fetch_single_quote_snapshot(
+            symbol, quote_max_age_seconds, allow_empty_bid=buy_to_close
+        )
         step = _chase_step(quote.bid, quote.ask)
         if sell_to_close:
             if hard_floor is None:
@@ -1778,7 +1794,8 @@ def close_single_option_leg_order(
             if hard_ceiling is None:
                 # Freeze the first executable ask as the safety ceiling.
                 hard_ceiling = _max_price_cent(quote.ask)
-            proposed = quote.bid if previous_limit is None else previous_limit + step
+            # A buy limit must be at least one cent even when there is no bid.
+            proposed = max(quote.bid, CENT) if previous_limit is None else previous_limit + step
             current_reference = min(quote.ask, hard_ceiling)
             attempt_limit = _max_price_cent(
                 min(hard_ceiling, max(proposed, min(quote.bid, current_reference)))
