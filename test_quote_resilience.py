@@ -2,12 +2,114 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from alpaca.trading.enums import PositionIntent
+
 import alpaca_integration
 import trade_workflow
+
+
+def option_quote(bid, ask, bid_size=10, ask_size=10):
+    return SimpleNamespace(
+        bid_price=bid,
+        ask_price=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+# NKE on 2026-10-02: the expiring short call had no bid at all.
+NO_BID_SHORT = option_quote("0", "0.01", bid_size=0)
+LIVE_LONG = option_quote("0.48", "0.53")
+
+
+class StopAfterCapture(Exception):
+    pass
+
+
+class EmptyBidTests(unittest.TestCase):
+    def fake_quotes(self, quotes):
+        client = Mock()
+        client.get_option_latest_quote.return_value = quotes
+        return (
+            patch.object(alpaca_integration, "OptionHistoricalDataClient", return_value=client),
+            patch.object(alpaca_integration, "_require_explicit_trading_mode"),
+        )
+
+    def test_empty_bid_is_rejected_unless_allowed(self):
+        with self.assertRaisesRegex(alpaca_integration.QuoteValidationError, "zero bid_size"):
+            alpaca_integration._validated_quote(NO_BID_SHORT, "SHORT", 120)
+        self.assertEqual(
+            alpaca_integration._validated_quote(NO_BID_SHORT, "SHORT", 120, allow_empty_bid=True),
+            (Decimal("0"), Decimal("0.01")),
+        )
+
+    def test_allowance_still_requires_a_consistent_bid_and_an_offer(self):
+        for quote, message in (
+            (option_quote("0.05", "0.10", bid_size=0), "zero bid_size"),
+            (option_quote("0", "0.01", bid_size=0, ask_size=0), "zero ask_size"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(alpaca_integration.QuoteValidationError, message):
+                    alpaca_integration._validated_quote(quote, "LEG", 120, allow_empty_bid=True)
+
+    def test_closing_accepts_an_empty_short_bid_but_opening_and_the_long_leg_do_not(self):
+        client_patch, mode_patch = self.fake_quotes({"SHORT": NO_BID_SHORT, "LONG": LIVE_LONG})
+        with client_patch, mode_patch:
+            snapshot = alpaca_integration._fetch_spread_quote_snapshot(
+                "SHORT", "LONG", 120, allow_empty_short_bid=True, validation_retry_delay_seconds=0
+            )
+            with self.assertRaisesRegex(alpaca_integration.QuoteValidationError, "zero bid_size"):
+                alpaca_integration._fetch_spread_quote_snapshot(
+                    "SHORT", "LONG", 120, validation_retry_delay_seconds=0
+                )
+        self.assertEqual(snapshot.closing_signed_ask, Decimal("-0.47"))
+
+        client_patch, mode_patch = self.fake_quotes({"SHORT": LIVE_LONG, "LONG": NO_BID_SHORT})
+        with client_patch, mode_patch:
+            with self.assertRaisesRegex(alpaca_integration.QuoteValidationError, "zero bid_size"):
+                alpaca_integration._fetch_spread_quote_snapshot(
+                    "SHORT", "LONG", 120, allow_empty_short_bid=True, validation_retry_delay_seconds=0
+                )
+
+    def test_calendar_close_requests_the_empty_short_bid_allowance(self):
+        fetch = Mock(side_effect=StopAfterCapture)
+        with (
+            patch.object(alpaca_integration, "init_alpaca_client"),
+            patch.object(alpaca_integration, "_fetch_spread_quote_snapshot", fetch),
+        ):
+            with self.assertRaises(StopAfterCapture):
+                alpaca_integration.close_calendar_spread_order(
+                    "SHORT", "LONG", 1, max_close_debit=Decimal("0.50"), client_order_id_prefix="test"
+                )
+        self.assertTrue(fetch.call_args.kwargs["allow_empty_short_bid"])
+
+    def test_single_leg_allowance_follows_the_side_and_a_no_bid_buy_starts_at_one_cent(self):
+        submitted = []
+
+        def capture(_client, request, _client_order_id):
+            submitted.append(request)
+            raise StopAfterCapture
+
+        for intent, allowed in ((PositionIntent.BUY_TO_CLOSE, True), (PositionIntent.SELL_TO_CLOSE, False)):
+            fetch = Mock(return_value=alpaca_integration.SingleQuoteSnapshot(Decimal("0"), Decimal("0.01")))
+            with (
+                self.subTest(intent=intent),
+                patch.object(alpaca_integration, "init_alpaca_client"),
+                patch.object(alpaca_integration, "_fetch_single_quote_snapshot", fetch),
+                patch.object(alpaca_integration, "_submit_order_idempotently", side_effect=capture),
+            ):
+                with self.assertRaises(StopAfterCapture):
+                    alpaca_integration.close_single_option_leg_order(
+                        "OPTION", 1, intent, client_order_id_prefix="test"
+                    )
+            self.assertIs(fetch.call_args.kwargs["allow_empty_bid"], allowed)
+        self.assertEqual(submitted[0].limit_price, 0.01)
 
 
 class QuoteRetryTests(unittest.TestCase):
