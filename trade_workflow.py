@@ -59,12 +59,16 @@ KNOWN_DEBITS = {"DG", "ORCL", "NKE"}
 KNOWN_SINGLE_CREDITS = {"CHPT", "LULU", "DRI", "KMX", "KR", "KMI"}
 KNOWN_ZERO_UNVERIFIED = {"GAP", "ASAN", "PL", "DOCU", "WOOF", "ERIC"}
 TERMINAL_STATUSES = {"filled", "canceled", "expired", "rejected"}
-SHEET_REQUIRED_FILL_FIELDS = {
-    "Ticker", "Short Symbol", "Long Symbol", "Open Date",
-    "Record ID", "Trade ID", "Parent Trade ID", "Broker Order ID", "Broker Fill ID",
-    "Sync Type", "Fill Phase", "Ordered Quantity", "Filled Quantity", "Remaining Quantity",
-    "Lifecycle Status", "Open Sync Status", "Close Sync Status", "Open Cash Flow",
-    "Close Cash Flow", "Fees", "Realized P&L", "Close Method", "Close Reason",
+# The Sheet holds one row per trade. The Apps Script must confirm this layout
+# and every field below before an outbox event counts as synced.
+SHEET_LAYOUT = "trade-rows"
+SHEET_REQUIRED_TRADE_FIELDS = {
+    "Ticker", "Size", "Open Date", "Open Price", "Close Date", "Close Price",
+    "Short Symbol", "Long Symbol", "Record ID", "Trade ID", "Parent Trade ID",
+    "Broker Order ID", "Broker Fill ID", "Sync Type", "Fill Phase",
+    "Ordered Quantity", "Filled Quantity", "Remaining Quantity", "Lifecycle Status",
+    "Open Sync Status", "Close Sync Status", "Open Cash Flow", "Close Cash Flow",
+    "Fees", "Realized P&L", "Close Method", "Close Reason",
     "Broker Mode", "Broker Account Fingerprint", "P&L Status",
 }
 
@@ -234,6 +238,12 @@ def init_db():
         for table in ("broker_orders", "fills"):
             if "commission_status" not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN commission_status TEXT")
+        # Trades synced as one row per fill are re-sent once as one row per
+        # trade, which lets the Sheet fold each entry/exit pair into one row.
+        trade_rows_migration="sheet_trade_rows_v1"
+        if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_name=?",(trade_rows_migration,)).fetchone():
+            conn.execute("UPDATE sheet_outbox SET state='pending',last_error=NULL,updated_at=? WHERE state='synced'",(stamp(),))
+            conn.execute("INSERT INTO schema_migrations VALUES(?,?)",(trade_rows_migration,stamp()))
 
 
 def migrate_historical(conn):
@@ -557,45 +567,72 @@ def pnl_status(realized_pnl_cents, commission_status):
     return "PROVISIONAL_FEES_UNKNOWN" if commission_status=="unavailable" else "CONFIRMED"
 
 
-def sheet_payload(conn, trade_id, fill_id):
-    trade = conn.execute("SELECT * FROM trades WHERE trade_id=?",(trade_id,)).fetchone()
-    fill = conn.execute("SELECT * FROM fills WHERE fill_id=?",(fill_id,)).fetchone()
-    order = conn.execute("SELECT * FROM broker_orders WHERE order_id=?",(fill["broker_order_id"],)).fetchone()
+def average_price(cash_flow_cents, quantity):
+    """Average per-share price of fills totalling a cash flow in cents.
+
+    Like the Sheet's earlier rows, a price paid is positive and a credit
+    received is negative.
+    """
+    if not quantity:
+        return ""
+    return float((Decimal(-int(cash_flow_cents)) / Decimal(int(quantity) * 10000)).quantize(Decimal("0.0001")).normalize())
+
+
+def trade_sheet_payload(conn, trade_id):
+    """Build the trade's single Sheet row from the ledger's current totals.
+
+    Every fill of the trade is summed, so replaying a sync rewrites the same row
+    with the same values. Entry and exit share the row; while contracts remain
+    the exit columns stay empty and the Sheet shows the trade as OPEN.
+    """
+    trade=conn.execute("SELECT * FROM trades WHERE trade_id=?",(trade_id,)).fetchone()
+    if not trade:
+        raise OperationalFailure(f"Cannot build a Sheet row for unknown trade {trade_id}")
     identity=conn.execute("SELECT broker_mode,account_fingerprint FROM broker_identity WHERE singleton_id=1").fetchone()
     if not identity:
-        raise OperationalFailure("Cannot enqueue a Sheet event before the ledger is bound to a broker account")
-    opening_fee_unknown=bool(conn.execute('''SELECT 1 FROM fills WHERE trade_id=? AND phase='open'
-      AND commission_status='unavailable' LIMIT 1''',(trade_id,)).fetchone())
-    effective_commission_status=("unavailable" if opening_fee_unknown or fill["commission_status"]=="unavailable"
-                                 else fill["commission_status"])
-    fill_pnl_status=pnl_status(fill["realized_pnl_cents"],effective_commission_status)
+        raise OperationalFailure("Cannot sync a Sheet row before the ledger is bound to a broker account")
+    fills=conn.execute("SELECT * FROM fills WHERE trade_id=? ORDER BY occurred_at,fill_id",(trade_id,)).fetchall()
+    opening=[fill for fill in fills if fill["phase"]=="open"]
+    closing=[fill for fill in fills if fill["phase"]=="close"]
+    opened=sum(int(fill["filled_quantity"]) for fill in opening)
+    closed=sum(int(fill["filled_quantity"]) for fill in closing)
+    if not opened:
+        raise OperationalFailure(f"Trade {trade_id} has no opening fill to show in the Sheet")
+    open_cf=sum(int(fill["cash_flow_cents"]) for fill in opening)
+    close_cf=sum(int(fill["cash_flow_cents"]) for fill in closing)
+    open_fees=sum(int(fill["fees_cents"]) for fill in opening)
+    close_fees=sum(int(fill["fees_cents"]) for fill in closing)
+    fees_unknown=any(fill["commission_status"]=="unavailable" for fill in fills)
+    realized=sum(int(fill["realized_pnl_cents"] or 0) for fill in closing) if closing else None
+    remaining=opened-closed
+    order_ids=list(dict.fromkeys(fill["broker_order_id"] for fill in fills if fill["broker_order_id"]))
     return {
-      "action":"upsert","Record ID":fill["fill_id"],"Trade ID":trade["trade_id"],
-      "Parent Trade ID":trade["parent_trade_id"],"Broker Order ID":fill["broker_order_id"] or "",
-      "Broker Fill ID":fill["broker_activity_id"] or "","Sync Type":"fill","Fill Phase":fill["phase"],
+      "action":"upsert","Sync Type":"trade","Trade ID":trade["trade_id"],
+      "Parent Trade ID":trade["parent_trade_id"] or trade["trade_id"],
+      # Clearing the per-fill keys lets the Sheet fold older fill rows into this one.
+      "Record ID":"","Broker Fill ID":"","Fill Phase":"",
+      "Broker Order ID":", ".join(order_ids),
       "Broker Mode":identity["broker_mode"],"Broker Account Fingerprint":identity["account_fingerprint"],
-      "Ordered Quantity":int(order["ordered_quantity"] if order else fill["filled_quantity"]),
-      "Filled Quantity":int(fill["filled_quantity"]),"Remaining Quantity":int(trade["remaining_quantity"] or 0),
-      "Lifecycle Status":trade["lifecycle_status"],"Open Sync Status":trade["open_sync_status"],
-      "Close Sync Status":trade["close_sync_status"],
-      "Open Cash Flow":cents_to_dollars(fill["cash_flow_cents"] if fill["phase"]=="open" else fill["allocated_open_cash_flow_cents"]),
-      "Close Cash Flow":cents_to_dollars(fill["cash_flow_cents"] if fill["phase"]=="close" else 0),
-      "Fees":"" if fill["commission_status"]=="unavailable" else cents_to_dollars(fill["fees_cents"]+fill["allocated_open_fees_cents"]),
-      "Realized P&L":"" if fill["realized_pnl_cents"] is None else cents_to_dollars(fill["realized_pnl_cents"]),
-      "P&L Status":fill_pnl_status,
-      "Close Method":trade["close_method"] or "","Close Reason":trade["close_reason"] or "",
       "Ticker":trade["Ticker"],"Implied Move":trade["Implied Move"] or "","Structure":trade["Structure"] or "Calendar Spread",
-      "Side":trade["Side"] or "debit","When":trade["When"] or "","Size":int(fill["filled_quantity"]),
+      "Side":trade["Side"] or "debit","When":trade["When"] or "","Size":opened,
       "Short Symbol":trade["Short Symbol"] or "","Long Symbol":trade["Long Symbol"] or "",
-      "Open Date":trade["Open Date"] or "","Open Price":float(fill["price"]) if fill["phase"]=="open" else "",
-      "Open Comm.":cents_to_dollars(fill["fees_cents"]) if fill["phase"]=="open" else 0,
-      "Close Date":trade["Close Date"] or "","Close Price":float(fill["price"]) if fill["phase"]=="close" else "",
-      "Close Comm.":cents_to_dollars(fill["fees_cents"]) if fill["phase"]=="close" else 0,
+      "Open Date":trade["Open Date"] or "","Open Price":average_price(open_cf,opened),
+      "Open Comm.":cents_to_dollars(open_fees),
+      "Close Date":(trade["Close Date"] or "") if remaining==0 else "",
+      "Close Price":average_price(close_cf,closed),"Close Comm.":cents_to_dollars(close_fees),
+      "Ordered Quantity":int(trade["ordered_quantity"] or opened),"Filled Quantity":opened,
+      "Remaining Quantity":remaining,"Lifecycle Status":trade["lifecycle_status"] or "",
+      "Open Sync Status":"synced","Close Sync Status":"synced" if closed else "not_applicable",
+      "Open Cash Flow":cents_to_dollars(open_cf),"Close Cash Flow":cents_to_dollars(close_cf),
+      "Fees":"" if fees_unknown else cents_to_dollars(open_fees+close_fees),
+      "Realized P&L":"" if realized is None else cents_to_dollars(realized),
+      "P&L Status":pnl_status(realized if remaining==0 else None,"unavailable" if fees_unknown else "confirmed"),
+      "Close Method":trade["close_method"] or "","Close Reason":trade["close_reason"] or "",
     }
 
 
 def enqueue_fill(conn, trade_id, fill_id, phase):
-    payload = json.dumps(sheet_payload(conn,trade_id,fill_id),separators=(",",":"))
+    payload = json.dumps(trade_sheet_payload(conn,trade_id),separators=(",",":"))
     conn.execute('''INSERT INTO sheet_outbox(event_id,trade_id,fill_id,phase,payload_json,state,attempts,created_at,updated_at)
       VALUES(?,?,?,?,?,'pending',0,?,?) ON CONFLICT(event_id) DO UPDATE SET payload_json=excluded.payload_json,
       state=CASE WHEN sheet_outbox.state='synced' THEN 'synced' ELSE 'pending' END,updated_at=excluded.updated_at''',
@@ -765,20 +802,15 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
     if not re.fullmatch(r"https://script\.google\.com/macros/s/[^/]+/exec", GOOGLE_SCRIPT_URL):
         raise OperationalFailure("GOOGLE_SCRIPT_URL is not a valid Apps Script web deployment URL")
     with db() as conn:
-        events=conn.execute('''SELECT sheet_outbox.*,fills.realized_pnl_cents AS outbox_realized_pnl_cents,
-          CASE WHEN fills.commission_status='unavailable' OR EXISTS(
-            SELECT 1 FROM fills AS opening_fill WHERE opening_fill.trade_id=sheet_outbox.trade_id
-            AND opening_fill.phase='open' AND opening_fill.commission_status='unavailable'
-          ) THEN 'unavailable' ELSE fills.commission_status END AS outbox_commission_status
-          FROM sheet_outbox JOIN fills
-          ON fills.fill_id=sheet_outbox.fill_id WHERE sheet_outbox.state!='synced'
-          ORDER BY sheet_outbox.created_at''').fetchall()
-        identity=conn.execute("SELECT broker_mode,account_fingerprint FROM broker_identity WHERE singleton_id=1").fetchone()
-    if events and not identity:
-        raise OperationalFailure("Cannot sync Sheet events from an unbound broker ledger")
+        events=conn.execute('''SELECT event_id,trade_id,fill_id FROM sheet_outbox
+          WHERE state!='synced' ORDER BY created_at''').fetchall()
+    # Every pending fill of a trade is covered by one snapshot of that trade's row.
+    trades={}
+    for event in events:
+        trades.setdefault(event["trade_id"],[]).append(event)
     failures=[]
     processed=0
-    for event in events:
+    for trade_id,trade_events in trades.items():
         if processed>=max_events:
             break
         # A failed Apps Script call can consume about a minute across bounded
@@ -786,22 +818,9 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
         if deadline is not None and time_module.monotonic()+70>=deadline:
             break
         processed+=1
-        payload=json.loads(event["payload_json"])
         with db() as conn:
-            sync_state=conn.execute(
-                "SELECT open_sync_status,close_sync_status FROM trades WHERE trade_id=?",
-                (event["trade_id"],),
-            ).fetchone()
-        if not sync_state:
-            raise OperationalFailure(f"Cannot sync Sheet event for unknown trade {event['trade_id']}")
-        payload["Broker Mode"]=identity["broker_mode"]
-        payload["Broker Account Fingerprint"]=identity["account_fingerprint"]
-        payload["P&L Status"]=pnl_status(event["outbox_realized_pnl_cents"],event["outbox_commission_status"])
+            payload=trade_sheet_payload(conn,trade_id)
         payload["auth_token"]=GOOGLE_SCRIPT_SECRET
-        payload["Open Sync Status"]=sync_state["open_sync_status"] or ""
-        payload["Close Sync Status"]=sync_state["close_sync_status"] or ""
-        payload["Open Sync Status"]="synced" if event["phase"]=="open" else payload.get("Open Sync Status","")
-        payload["Close Sync Status"]="synced" if event["phase"]=="close" else payload.get("Close Sync Status","")
         ok=False; last_error="unknown error"
         for attempt in range(1,4):
             try:
@@ -810,32 +829,39 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
                 body=response.json()
                 if not isinstance(body,dict) or body.get("ok") is not True or body.get("status") != 200:
                     raise OperationalFailure(f"Sheet logical error: {body.get('error') if isinstance(body,dict) else 'invalid JSON'}")
+                if body.get("layout")!=SHEET_LAYOUT:
+                    raise OperationalFailure(
+                        "The Sheet's Apps Script does not support one row per trade; deploy the current code.gs"
+                    )
                 written_headers=set(body.get("written_headers") or ())
-                missing_written=SHEET_REQUIRED_FILL_FIELDS-written_headers
+                missing_written=SHEET_REQUIRED_TRADE_FIELDS-written_headers
                 if missing_written:
                     raise OperationalFailure(
-                        "Sheet response did not confirm all required fill fields: "
+                        "Sheet response did not confirm all required trade fields: "
                         + ", ".join(sorted(missing_written))
                     )
                 ok=True; break
             except (requests.RequestException,ValueError,OperationalFailure) as exc:
                 last_error=redact(exc)
                 if attempt<3: time_module.sleep(attempt)
+        event_ids=[event["event_id"] for event in trade_events]
+        marks=",".join("?"*len(event_ids))
         with db(write=True) as conn:
             if ok:
-                conn.execute("UPDATE sheet_outbox SET state='synced',attempts=attempts+1,last_error=NULL,updated_at=? WHERE event_id=?",(stamp(),event["event_id"]))
-                conn.execute("UPDATE fills SET sync_status='synced' WHERE fill_id=?",(event["fill_id"],))
-                pending=conn.execute("SELECT COUNT(*) FROM sheet_outbox WHERE trade_id=? AND phase=? AND state!='synced'",(event["trade_id"],event["phase"])).fetchone()[0]
-                column="open_sync_status" if event["phase"]=="open" else "close_sync_status"
-                conn.execute(f"UPDATE trades SET {column}=? WHERE trade_id=?",("pending" if pending else "synced",event["trade_id"]))
+                conn.execute(f"UPDATE sheet_outbox SET state='synced',attempts=attempts+1,last_error=NULL,updated_at=? WHERE event_id IN ({marks})",(stamp(),*event_ids))
+                conn.execute(f"UPDATE fills SET sync_status='synced' WHERE fill_id IN ({marks})",tuple(event["fill_id"] for event in trade_events))
+                for phase,column in (("open","open_sync_status"),("close","close_sync_status")):
+                    if conn.execute("SELECT 1 FROM fills WHERE trade_id=? AND phase=? LIMIT 1",(trade_id,phase)).fetchone():
+                        pending=conn.execute("SELECT COUNT(*) FROM sheet_outbox WHERE trade_id=? AND phase=? AND state!='synced'",(trade_id,phase)).fetchone()[0]
+                        conn.execute(f"UPDATE trades SET {column}=? WHERE trade_id=?",("pending" if pending else "synced",trade_id))
             else:
-                conn.execute("UPDATE sheet_outbox SET state='pending',attempts=attempts+1,last_error=?,updated_at=? WHERE event_id=?",(last_error,stamp(),event["event_id"]))
-                failures.append(f"{event['event_id']}: {last_error}")
-    deferred=max(0,len(events)-processed)
+                conn.execute(f"UPDATE sheet_outbox SET state='pending',attempts=attempts+1,last_error=?,updated_at=? WHERE event_id IN ({marks})",(last_error,stamp(),*event_ids))
+                failures.append(f"{trade_id}: {last_error}")
+    deferred=max(0,len(trades)-processed)
     if deferred:
-        print(f"Deferred {deferred} Sheet outbox event(s) to a later run to preserve the workflow deadline.")
+        print(f"Deferred {deferred} trade(s) of Sheet updates to a later run to preserve the workflow deadline.")
     if failures:
-        print(f"{len(failures)} Sheet outbox event(s) remain queued: {failures[0]}", file=sys.stderr)
+        print(f"{len(failures)} trade(s) of Sheet updates remain queued: {failures[0]}", file=sys.stderr)
         return False
     return True
 

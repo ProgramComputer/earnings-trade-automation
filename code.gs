@@ -9,7 +9,8 @@ var RESERVED_PAYLOAD_FIELDS = {
   action: true,
   auth_token: true
 };
-var REQUIRED_FILL_HEADERS = [
+// Tracking columns the bot needs; missing ones are appended to the template.
+var TRACKING_HEADERS = [
   "Ticker", "Short Symbol", "Long Symbol", "Open Date",
   "Record ID", "Trade ID", "Parent Trade ID", "Broker Order ID", "Broker Fill ID",
   "Sync Type", "Fill Phase", "Ordered Quantity", "Filled Quantity", "Remaining Quantity",
@@ -17,6 +18,11 @@ var REQUIRED_FILL_HEADERS = [
   "Close Cash Flow", "Fees", "Realized P&L", "Close Method", "Close Reason",
   "Broker Mode", "Broker Account Fingerprint", "P&L Status"
 ];
+// Each trade is one row holding both the entry and the exit.
+var TRADE_ROW_LAYOUT = "trade-rows";
+var REQUIRED_TRADE_HEADERS = TRACKING_HEADERS.concat([
+  "Size", "Open Price", "Close Date", "Close Price"
+]);
 
 function doGet() {
   return jsonResponse_(false, 405, { error: "GET data export is disabled" });
@@ -68,26 +74,32 @@ function upsertRecord_(sheet, payload) {
   var recordId = normalizedId_(payload["Record ID"]);
   var tradeId = normalizedId_(payload["Trade ID"]);
   var syncType = String(payload["Sync Type"] || "").toLowerCase();
+  var isTradeRow = syncType === "trade";
   var validateSummary = false;
 
+  if (syncType === "fill") {
+    return jsonResponse_(false, 409, {
+      error: "One row per fill is retired; update the trading bot so it sends one row per trade"
+    });
+  }
+  if (isTradeRow && !tradeId) {
+    return jsonResponse_(false, 400, { error: "Trade rows require a Trade ID" });
+  }
   if (!recordId && !tradeId) {
     return jsonResponse_(false, 400, { error: "Record ID or Trade ID is required" });
   }
-  if (syncType === "fill" && !recordId) {
-    return jsonResponse_(false, 400, { error: "Fill upserts require a unique Record ID" });
-  }
-  if (syncType === "fill") {
-    var missingFields = REQUIRED_FILL_HEADERS.filter(function(header) {
+  if (isTradeRow) {
+    var missingFields = REQUIRED_TRADE_HEADERS.filter(function(header) {
       return !hasOwn_(payload, header);
     });
     if (missingFields.length) {
       return jsonResponse_(false, 400, {
-        error: "Fill payload is incomplete", missing_payload_fields: missingFields
+        error: "Trade payload is incomplete", missing_payload_fields: missingFields
       });
     }
-    // Only an authenticated fill request upgrades the connected Sheet. No
-    // setup run, manual fill insertion, or second spreadsheet is needed.
-    validateSummary = ensureFillSchema_(sheet);
+    // Only an authenticated trade request upgrades the connected Sheet. No
+    // setup run, manual row insertion, or second spreadsheet is needed.
+    validateSummary = ensureTradeSchema_(sheet);
   }
 
   var lastColumn = sheet.getLastColumn();
@@ -100,8 +112,8 @@ function upsertRecord_(sheet, payload) {
     return String(value).trim();
   });
   var headerMap = buildHeaderMap_(headers);
-  var keyHeader = recordId ? "Record ID" : "Trade ID";
-  var keyValue = recordId || tradeId;
+  var keyHeader = isTradeRow || !recordId ? "Trade ID" : "Record ID";
+  var keyValue = keyHeader === "Trade ID" ? tradeId : recordId;
 
   if (headerMap[keyHeader] === undefined) {
     return jsonResponse_(false, 409, { error: "Required sheet header is missing: " + keyHeader });
@@ -109,11 +121,15 @@ function upsertRecord_(sheet, payload) {
 
   var matchingRows = findMatchingRows_(sheet, lastRow, headerMap[keyHeader], keyValue);
   if (matchingRows.length > 1) {
-    return jsonResponse_(false, 409, {
-      error: "Duplicate stable IDs already exist in the Sheet",
-      key: keyHeader,
-      record_id: keyValue
-    });
+    // Earlier versions wrote a trade's entry and exit as separate fill rows.
+    // Only those bot-written rows may be folded together; anything else stops.
+    if (!isTradeRow || !areBotFillRows_(sheet, matchingRows, headerMap)) {
+      return jsonResponse_(false, 409, {
+        error: "Duplicate stable IDs already exist in the Sheet",
+        key: keyHeader,
+        record_id: keyValue
+      });
+    }
   }
 
   var protectedColumns = findFormulaColumns_(sheet, lastRow, lastColumn);
@@ -121,19 +137,19 @@ function upsertRecord_(sheet, payload) {
     return jsonResponse_(false, 409, { error: "Stable ID column is formula-managed and cannot be written: " + keyHeader });
   }
 
-  if (syncType === "fill") {
-    var missingHeaders = REQUIRED_FILL_HEADERS.filter(function(header) {
+  if (isTradeRow) {
+    var missingHeaders = REQUIRED_TRADE_HEADERS.filter(function(header) {
       return headerMap[header] === undefined;
     });
-    var missingPayloadFields = REQUIRED_FILL_HEADERS.filter(function(header) {
+    var missingPayloadFields = REQUIRED_TRADE_HEADERS.filter(function(header) {
       return !hasOwn_(payload, header);
     });
-    var protectedRequiredHeaders = REQUIRED_FILL_HEADERS.filter(function(header) {
+    var protectedRequiredHeaders = REQUIRED_TRADE_HEADERS.filter(function(header) {
       return headerMap[header] !== undefined && protectedColumns[headerMap[header]];
     });
     if (missingHeaders.length || missingPayloadFields.length || protectedRequiredHeaders.length) {
       return jsonResponse_(false, 409, {
-        error: "Sheet fill schema is incomplete or not writable",
+        error: "Sheet trade schema is incomplete or not writable",
         missing_headers: missingHeaders,
         missing_payload_fields: missingPayloadFields,
         protected_required_headers: protectedRequiredHeaders
@@ -149,6 +165,18 @@ function upsertRecord_(sheet, payload) {
   });
   if (writableHeaders.length === 0) {
     return jsonResponse_(false, 400, { error: "Payload contains no writable Sheet headers" });
+  }
+
+  var mergedRows = 0;
+  if (matchingRows.length > 1) {
+    // Keep the trade's first row (its entry) and delete the later fill rows,
+    // bottom-up so earlier row numbers stay valid. The write below then fills
+    // the kept row with the whole trade.
+    matchingRows.slice(1).reverse().forEach(function(rowNumber) {
+      sheet.deleteRow(rowNumber);
+    });
+    mergedRows = matchingRows.length - 1;
+    matchingRows = [matchingRows[0]];
   }
 
   var operation = matchingRows.length === 1 ? "updated" : "inserted";
@@ -167,13 +195,13 @@ function upsertRecord_(sheet, payload) {
   if (writeResult.writtenHeaders.indexOf(keyHeader) === -1 && operation === "inserted") {
     return jsonResponse_(false, 409, { error: "Stable ID was not written to the new row" });
   }
-  if (syncType === "fill") {
-    var unwrittenRequiredHeaders = REQUIRED_FILL_HEADERS.filter(function(header) {
+  if (isTradeRow) {
+    var unwrittenRequiredHeaders = REQUIRED_TRADE_HEADERS.filter(function(header) {
       return writeResult.writtenHeaders.indexOf(header) === -1;
     });
     if (unwrittenRequiredHeaders.length) {
       return jsonResponse_(false, 409, {
-        error: "Required fill fields were not written",
+        error: "Required trade fields were not written",
         unwritten_required_headers: unwrittenRequiredHeaders
       });
     }
@@ -181,19 +209,35 @@ function upsertRecord_(sheet, payload) {
 
   SpreadsheetApp.flush();
   if (validateSummary) {
-    validateFillSummary_(sheet, targetRow);
+    validateTradeSummary_(sheet, targetRow);
   }
-  return jsonResponse_(true, 200, {
+  var details = {
     operation: operation,
     row: targetRow,
     key: keyHeader,
     record_id: keyValue,
     written_headers: writeResult.writtenHeaders,
     ignored_formula_headers: writeResult.protectedHeaders
+  };
+  if (isTradeRow) {
+    details.layout = TRADE_ROW_LAYOUT;
+    details.merged_rows = mergedRows;
+  }
+  return jsonResponse_(true, 200, details);
+}
+
+function areBotFillRows_(sheet, rowNumbers, headerMap) {
+  if (headerMap["Record ID"] === undefined || headerMap["Sync Type"] === undefined) {
+    return false;
+  }
+  return rowNumbers.every(function(rowNumber) {
+    var recordId = normalizedId_(sheet.getRange(rowNumber, headerMap["Record ID"] + 1).getValue());
+    var syncType = normalizedId_(sheet.getRange(rowNumber, headerMap["Sync Type"] + 1).getValue()).toLowerCase();
+    return recordId !== "" && syncType === "fill";
   });
 }
 
-function ensureFillSchema_(sheet) {
+function ensureTradeSchema_(sheet) {
   var lastColumn = sheet.getLastColumn();
   if (lastColumn < 1) {
     throw new Error("Sheet has no header row");
@@ -202,12 +246,12 @@ function ensureFillSchema_(sheet) {
     return String(value).trim();
   });
   var headerMap = buildHeaderMap_(headers);
-  REQUIRED_FILL_HEADERS.forEach(function(header) {
+  REQUIRED_TRADE_HEADERS.forEach(function(header) {
     if (headers.indexOf(header) !== headers.lastIndexOf(header)) {
       throw new Error("Duplicate required Sheet header: " + header);
     }
   });
-  var missing = REQUIRED_FILL_HEADERS.filter(function(header) {
+  var missing = TRACKING_HEADERS.filter(function(header) {
     return headerMap[header] === undefined;
   });
   var firstNewColumn = sheet.getMaxColumns() + 1;
@@ -226,33 +270,35 @@ function ensureFillSchema_(sheet) {
     return index === 0 || index >= 12 || headers[index] === header;
   });
   if (!isLegacy && missing.length) {
-    throw new Error("Unrecognized Sheet layout; required fill headers must be configured before syncing");
+    throw new Error("Unrecognized Sheet layout; required trade headers must be configured before syncing");
   }
-  var formulas = isLegacy ? fillSummaryFormulas_(headerMap) : {};
+  var formulas = isLegacy ? tradeSummaryFormulas_(headerMap) : {};
+  var fillFormulas = isLegacy ? fillSummaryFormulas_(headerMap) : {};
   var originalFormulas = {
     "A1": "=ARRAYFORMULA({\"Result\";IF(B2:B<>\"\",IF( ISNUMBER(M2:M),IF(M2:M>0,\"WIN\",\"LOSS\"),\"OPEN\"),\"\")})",
     "M1": "=ARRAYFORMULA({\"$ Return\";\n  IF(\n    J2:J=\"\",\n    \"\",\n    F2:F * ((ABS(H2:H)-ABS(K2:K)) * 100)\n      * IF(E2:E=\"credit\", 1, -1)\n      - (I2:I + L2:L)\n  )}\n)",
     "N1": "=ARRAYFORMULA({\"% Return on Premium\";\n  IF(\n    M2:M=\"\",\n    \"\",\n    M2:M\n      / ( H2:H * 100 * F2:F )\n  )}\n)"
   };
-  // Check every formula before making any change. Only the known template or
-  // this migration's formulas are eligible; custom formulas are never replaced.
+  // Check every formula before making any change. Only the known template,
+  // the per-fill version's formulas, or the current formulas are eligible;
+  // custom formulas are never replaced.
   Object.keys(formulas).forEach(function(cell) {
-    var current = sheet.getRange(cell).getFormula();
-    if (compactFormula_(current) !== compactFormula_(originalFormulas[cell]) &&
-        compactFormula_(current) !== compactFormula_(formulas[cell])) {
-      throw new Error("Custom Sheet formula needs review before fill sync: " + cell);
+    var current = compactFormula_(sheet.getRange(cell).getFormula());
+    var known = [originalFormulas[cell], fillFormulas[cell], formulas[cell]].map(compactFormula_);
+    if (known.indexOf(current) === -1) {
+      throw new Error("Custom Sheet formula needs review before trade sync: " + cell);
     }
   });
   var protectedColumns = findFormulaColumns_(sheet, Math.max(sheet.getLastRow(), 1), lastColumn);
-  REQUIRED_FILL_HEADERS.forEach(function(header) {
+  REQUIRED_TRADE_HEADERS.forEach(function(header) {
     if (protectedColumns[headerMap[header]]) {
-      throw new Error("Required fill column is formula-managed: " + header);
+      throw new Error("Required trade column is formula-managed: " + header);
     }
   });
 
   if (isLegacy && compactFormula_(sheet.getRange("O1").getFormula()) !==
       compactFormula_('=ARRAYFORMULA({"Cumulative Return $";IF(M2:M="","",SUMIF(ROW(M2:M),"<="&ROW(M2:M),M2:M))})')) {
-    throw new Error("Custom Sheet formula needs review before fill sync: O1");
+    throw new Error("Custom Sheet formula needs review before trade sync: O1");
   }
 
   if (missing.length) {
@@ -273,7 +319,7 @@ function ensureFillSchema_(sheet) {
   return isLegacy;
 }
 
-function validateFillSummary_(sheet, rowNumber) {
+function validateTradeSummary_(sheet, rowNumber) {
   var columns = [0, 12, 13, 14];
   var expected = ["Result", "$ Return", "% Return on Premium", "Cumulative Return $"];
   var headers = sheet.getRange(1, 1, 1, 15).getDisplayValues()[0];
@@ -300,6 +346,35 @@ function sheetColumn_(zeroBasedColumn) {
   return result;
 }
 
+function tradeSummaryFormulas_(headerMap) {
+  var columns = {
+    "AF": "Record ID",
+    "AK": "Sync Type",
+    "AO": "Remaining Quantity",
+    "AP": "Lifecycle Status",
+    "AS": "Open Cash Flow",
+    "AV": "Realized P&L"
+  };
+  // Legacy rows retain their calculation. A trade row shows the ledger's
+  // realized P&L once every contract is closed, and its return is measured
+  // against the opening cash. Fill rows left from the per-fill version show
+  // no return; the next sync of their trade folds them into one trade row.
+  var formulas = {
+    "M1": "={\"$ Return\";MAP(B2:B,@AF@2:@AF@,@AK@2:@AK@,@AO@2:@AO@,@AP@2:@AP@,@AV@2:@AV@,F2:F,E2:E,H2:H,I2:I,J2:J,K2:K,L2:L,LAMBDA(ticker,record,synctype,remaining,lifecycle,pnl,qty,side,entry,entryfee,exitdate,exitprice,exitfee,IF(ticker=\"\",\"\",IF(synctype=\"trade\",IF(AND(lifecycle=\"CLOSED\",remaining=0,ISNUMBER(pnl)),pnl,\"\"),IF(record=\"\",IF(exitdate=\"\",\"\",qty*((ABS(entry)-ABS(exitprice))*100)*IF(side=\"credit\",1,-1)-(entryfee+exitfee)),\"\")))))}",
+    "N1": "={\"% Return on Premium\";MAP(M2:M,@AK@2:@AK@,@AS@2:@AS@,H2:H,F2:F,LAMBDA(pnl,synctype,opencash,entry,qty,IF(pnl=\"\",\"\",IF(synctype=\"trade\",IF(opencash=0,\"\",pnl/ABS(opencash)),pnl/(entry*100*qty)))))}"
+  };
+  Object.keys(formulas).forEach(function(cell) {
+    formulas[cell] = formulas[cell].replace(/@([A-Z]+)@/g, function(token, key) {
+      return sheetColumn_(headerMap[columns[key]]);
+    });
+  });
+  // The per-fill Result formula already labels trade rows WIN, LOSS, or OPEN,
+  // and still marks any fill row that has not been folded in yet.
+  formulas["A1"] = fillSummaryFormulas_(headerMap)["A1"];
+  return formulas;
+}
+
+// Formulas installed by the per-fill version, recognized so its Sheets upgrade.
 function fillSummaryFormulas_(headerMap) {
   var columns = {
     "AF": "Record ID",

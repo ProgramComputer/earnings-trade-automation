@@ -272,109 +272,177 @@ class CloseIsolationTests(unittest.TestCase):
         finalize.assert_called_once_with("trade-good", good_result)
 
 
-class SheetSyncStatusTests(unittest.TestCase):
-    def test_each_fill_payload_uses_the_trades_current_sync_statuses(self):
-        class SuccessfulResponse:
-            def raise_for_status(self):
-                return None
+class SheetResponse:
+    def __init__(self, body):
+        self.body = body
 
-            def json(self):
-                return {
-                    "ok": True,
-                    "status": 200,
-                    "written_headers": list(trade_workflow.SHEET_REQUIRED_FILL_FIELDS),
-                }
+    def raise_for_status(self):
+        return None
 
-        original_path = trade_workflow.DB_PATH
-        original_url = trade_workflow.GOOGLE_SCRIPT_URL
-        original_secret = trade_workflow.GOOGLE_SCRIPT_SECRET
-        with tempfile.TemporaryDirectory() as directory:
-            trade_workflow.DB_PATH = Path(directory) / "test.db"
-            trade_workflow.GOOGLE_SCRIPT_URL = (
-                "https://script.google.com/macros/s/test-deployment/exec"
+    def json(self):
+        return self.body
+
+
+def trade_row_response(payload_fields=None):
+    return SheetResponse({
+        "ok": True,
+        "status": 200,
+        "layout": "trade-rows",
+        "written_headers": sorted(payload_fields or trade_workflow.SHEET_REQUIRED_TRADE_FIELDS),
+    })
+
+
+class SheetTradeRowTests(unittest.TestCase):
+    """NIO: 178 contracts opened in two fills of 89, then closed in one fill."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for name, value in (
+            ("DB_PATH", Path(directory.name) / "trades.db"),
+            ("GOOGLE_SCRIPT_URL", "https://script.google.com/macros/s/test-deployment/exec"),
+            ("GOOGLE_SCRIPT_SECRET", "test-only-secret"),
+        ):
+            patcher = patch.object(trade_workflow, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        sleep = patch.object(trade_workflow.time_module, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+        trade_workflow.init_db()
+        with trade_workflow.db(write=True) as conn:
+            conn.execute(
+                """INSERT INTO broker_identity VALUES(1,'PAPER','fingerprint',
+                'https://paper-api.alpaca.markets','2026-08-31','2026-08-31')"""
             )
-            trade_workflow.GOOGLE_SCRIPT_SECRET = "test-only-secret"
-            try:
-                connection = sqlite3.connect(trade_workflow.DB_PATH)
-                connection.executescript(
-                    """
-                    CREATE TABLE trades(
-                      trade_id TEXT PRIMARY KEY,
-                      open_sync_status TEXT,
-                      close_sync_status TEXT
-                    );
-                    CREATE TABLE fills(
-                      fill_id TEXT PRIMARY KEY,
-                      trade_id TEXT,
-                      phase TEXT,
-                      realized_pnl_cents INTEGER,
-                      commission_status TEXT,
-                      sync_status TEXT
-                    );
-                    CREATE TABLE sheet_outbox(
-                      event_id TEXT PRIMARY KEY,
-                      trade_id TEXT,
-                      fill_id TEXT,
-                      phase TEXT,
-                      payload_json TEXT,
-                      state TEXT,
-                      attempts INTEGER,
-                      last_error TEXT,
-                      created_at TEXT,
-                      updated_at TEXT
-                    );
-                    CREATE TABLE broker_identity(
-                      singleton_id INTEGER PRIMARY KEY,
-                      broker_mode TEXT,
-                      account_fingerprint TEXT
-                    );
-                    INSERT INTO trades VALUES('trade-1','pending','pending');
-                    INSERT INTO fills VALUES('fill-open','trade-1','open',NULL,'confirmed','pending');
-                    INSERT INTO fills VALUES('fill-close','trade-1','close',-100,'confirmed','pending');
-                    INSERT INTO sheet_outbox VALUES(
-                      'fill-open','trade-1','fill-open','open',
-                      '{"Open Sync Status":"stale","Close Sync Status":"stale"}',
-                      'pending',0,NULL,'2026-09-01','2026-09-01'
-                    );
-                    INSERT INTO sheet_outbox VALUES(
-                      'fill-close','trade-1','fill-close','close',
-                      '{"Open Sync Status":"stale","Close Sync Status":"stale"}',
-                      'pending',0,NULL,'2026-09-02','2026-09-02'
-                    );
-                    INSERT INTO broker_identity VALUES(1,'PAPER','fingerprint');
-                    """
+            conn.execute(
+                """INSERT INTO trades("Ticker","Implied Move","Side","When","Size","Short Symbol",
+                "Long Symbol","Open Date","Close Date",trade_id,parent_trade_id,ordered_quantity,
+                lifecycle_status,close_method,close_reason,open_sync_status,close_sync_status)
+                VALUES('NIO','8%','debit','BMO',178,'NIO-SHORT','NIO-LONG','2026-08-31',
+                '2026-09-02','trade-1','trade-1',178,'CLOSED','calendar','scheduled_exit',
+                'pending','pending')"""
+            )
+            for order_id, phase in (("order-open", "open"), ("order-close", "close")):
+                conn.execute(
+                    """INSERT INTO broker_orders(order_id,trade_id,phase,method,ordered_quantity,
+                    filled_quantity,lifecycle_status,terminal,updated_at)
+                    VALUES(?,?,?,'calendar',178,178,'filled',1,'2026-09-02')""",
+                    (order_id, "trade-1", phase),
                 )
-                connection.commit()
-                connection.close()
+        self.add_fill("fill-open-1", "order-open", "open", 89, -106800, None, "2026-08-31T19:00:00+00:00")
+        self.add_fill("fill-open-2", "order-open", "open", 178, -106800, None, "2026-08-31T19:01:00+00:00")
 
-                with patch.object(
-                    trade_workflow.requests,
-                    "post",
-                    side_effect=[SuccessfulResponse(), SuccessfulResponse()],
-                ) as post:
-                    self.assertTrue(trade_workflow.sync_sheet_outbox())
+    def add_fill(self, fill_id, order_id, phase, cumulative, cash_flow_cents, realized_pnl_cents, occurred_at):
+        quantity = 89 if phase == "open" else 178
+        with trade_workflow.db(write=True) as conn:
+            conn.execute(
+                """INSERT INTO fills(fill_id,trade_id,parent_trade_id,broker_order_id,
+                broker_activity_id,phase,method,cumulative_order_filled_quantity,filled_quantity,
+                price,cash_flow_cents,fees_cents,realized_pnl_cents,commission_status,occurred_at)
+                VALUES(?,'trade-1','trade-1',?,?,?,'calendar',?,?,?,?,0,?,'confirmed',?)""",
+                (fill_id, order_id, f"activity-{fill_id}", phase, cumulative, quantity,
+                 "0.12" if phase == "open" else "0.04", cash_flow_cents,
+                 realized_pnl_cents, occurred_at),
+            )
+            conn.execute(
+                """INSERT INTO sheet_outbox(event_id,trade_id,fill_id,phase,payload_json,state,
+                attempts,created_at,updated_at) VALUES(?,'trade-1',?,?,'{}','pending',0,?,?)""",
+                (fill_id, fill_id, phase, occurred_at, occurred_at),
+            )
 
-                first_payload = post.call_args_list[0].kwargs["json"]
-                second_payload = post.call_args_list[1].kwargs["json"]
-                connection = sqlite3.connect(trade_workflow.DB_PATH)
-                trade_status = connection.execute(
-                    "SELECT open_sync_status,close_sync_status FROM trades"
-                ).fetchone()
-                outbox_states = connection.execute(
-                    "SELECT state FROM sheet_outbox ORDER BY created_at"
-                ).fetchall()
-                connection.close()
-            finally:
-                trade_workflow.DB_PATH = original_path
-                trade_workflow.GOOGLE_SCRIPT_URL = original_url
-                trade_workflow.GOOGLE_SCRIPT_SECRET = original_secret
+    def close_trade(self):
+        self.add_fill("fill-close", "order-close", "close", 178, 71200, -142400, "2026-09-02T19:00:00+00:00")
+        with trade_workflow.db(write=True) as conn:
+            conn.execute("UPDATE trades SET remaining_quantity=0 WHERE trade_id='trade-1'")
 
-        self.assertEqual(first_payload["Open Sync Status"], "synced")
-        self.assertEqual(first_payload["Close Sync Status"], "pending")
-        self.assertEqual(second_payload["Open Sync Status"], "synced")
-        self.assertEqual(second_payload["Close Sync Status"], "synced")
-        self.assertEqual(trade_status, ("synced", "synced"))
-        self.assertEqual(outbox_states, [("synced",), ("synced",)])
+    def ledger(self, query):
+        with trade_workflow.db() as conn:
+            return [tuple(row) for row in conn.execute(query).fetchall()]
+
+    def test_an_open_trade_is_one_row_with_empty_exit_columns(self):
+        with trade_workflow.db() as conn:
+            payload = trade_workflow.trade_sheet_payload(conn, "trade-1")
+
+        self.assertEqual(payload["Sync Type"], "trade")
+        self.assertEqual(payload["Record ID"], "")
+        self.assertEqual(payload["Size"], 178)
+        self.assertEqual(payload["Open Price"], 0.12)
+        self.assertEqual(payload["Open Cash Flow"], -2136.0)
+        self.assertEqual(payload["Close Date"], "")
+        self.assertEqual(payload["Close Price"], "")
+        self.assertEqual(payload["Remaining Quantity"], 178)
+        self.assertEqual(payload["Realized P&L"], "")
+        self.assertEqual(payload["P&L Status"], "NOT_REALIZED")
+        self.assertEqual(payload["Close Sync Status"], "not_applicable")
+
+    def test_every_pending_fill_of_a_trade_is_sent_as_one_row(self):
+        self.close_trade()
+        with patch.object(trade_workflow.requests, "post", return_value=trade_row_response()) as post:
+            self.assertTrue(trade_workflow.sync_sheet_outbox())
+
+        post.assert_called_once()
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["auth_token"], "test-only-secret")
+        self.assertEqual(payload["Trade ID"], "trade-1")
+        self.assertEqual(payload["Record ID"], "")
+        self.assertEqual(payload["Fill Phase"], "")
+        self.assertEqual(payload["Broker Order ID"], "order-open, order-close")
+        self.assertEqual(payload["Size"], 178)
+        self.assertEqual(payload["Open Price"], 0.12)
+        self.assertEqual(payload["Close Date"], "2026-09-02")
+        self.assertEqual(payload["Close Price"], -0.04)
+        self.assertEqual(payload["Open Cash Flow"], -2136.0)
+        self.assertEqual(payload["Close Cash Flow"], 712.0)
+        self.assertEqual(payload["Remaining Quantity"], 0)
+        self.assertEqual(payload["Realized P&L"], -1424.0)
+        self.assertEqual(payload["P&L Status"], "CONFIRMED")
+        self.assertEqual(payload["Open Sync Status"], "synced")
+        self.assertEqual(payload["Close Sync Status"], "synced")
+        self.assertEqual(self.ledger("SELECT DISTINCT state FROM sheet_outbox"), [("synced",)])
+        self.assertEqual(self.ledger("SELECT DISTINCT sync_status FROM fills"), [("synced",)])
+        self.assertEqual(
+            self.ledger("SELECT open_sync_status,close_sync_status FROM trades"),
+            [("synced", "synced")],
+        )
+
+    def test_an_apps_script_without_trade_rows_keeps_the_events_queued(self):
+        old_script = SheetResponse({
+            "ok": True,
+            "status": 200,
+            "written_headers": sorted(trade_workflow.SHEET_REQUIRED_TRADE_FIELDS),
+        })
+        with patch.object(trade_workflow.requests, "post", return_value=old_script) as post:
+            self.assertFalse(trade_workflow.sync_sheet_outbox())
+
+        self.assertEqual(post.call_count, 3)
+        states = self.ledger("SELECT state,last_error FROM sheet_outbox")
+        self.assertEqual(len(states), 2)
+        for state, last_error in states:
+            self.assertEqual(state, "pending")
+            self.assertIn("one row per trade", last_error)
+        self.assertEqual(self.ledger("SELECT DISTINCT sync_status FROM fills"), [("pending",)])
+
+    def test_unconfirmed_trade_fields_keep_the_events_queued(self):
+        partial = trade_row_response(trade_workflow.SHEET_REQUIRED_TRADE_FIELDS - {"Close Price"})
+        with patch.object(trade_workflow.requests, "post", return_value=partial):
+            self.assertFalse(trade_workflow.sync_sheet_outbox())
+
+        for state, last_error in self.ledger("SELECT state,last_error FROM sheet_outbox"):
+            self.assertEqual(state, "pending")
+            self.assertIn("Close Price", last_error)
+
+    def test_rows_synced_one_per_fill_are_sent_again_once(self):
+        with trade_workflow.db(write=True) as conn:
+            conn.execute("UPDATE sheet_outbox SET state='synced'")
+            conn.execute("DELETE FROM schema_migrations WHERE migration_name='sheet_trade_rows_v1'")
+        trade_workflow.init_db()
+        self.assertEqual(self.ledger("SELECT DISTINCT state FROM sheet_outbox"), [("pending",)])
+
+        with trade_workflow.db(write=True) as conn:
+            conn.execute("UPDATE sheet_outbox SET state='synced'")
+        trade_workflow.init_db()
+        self.assertEqual(self.ledger("SELECT DISTINCT state FROM sheet_outbox"), [("synced",)])
 
 
 if __name__ == "__main__":
