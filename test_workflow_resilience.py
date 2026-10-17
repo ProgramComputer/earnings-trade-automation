@@ -459,33 +459,41 @@ class TimingRefusalTests(unittest.TestCase):
                         run(refuse_on_attempt(2, error))
                 self.assertEqual(len(submitted), 1)
 
-    def guard_with_clock(self, clock, deadline=10_000, **guard_kwargs):
+    def guard_with_clock(self, clock, deadline=10_000, monotonic=(0, 0), **guard_kwargs):
         client = Mock()
         client.get_clock.return_value = clock
         with (
             patch.object(trade_workflow, "reconcile_broker_state"),
             patch.object(trade_workflow, "account_snapshot", return_value=(Decimal("100000"), Decimal("100000"))),
             patch.object(trade_workflow, "exposure_cents", return_value=0),
-            patch.object(trade_workflow.time_module, "monotonic", return_value=0),
+            # The guard reads the clock before and after its broker calls.
+            patch.object(trade_workflow.time_module, "monotonic", side_effect=list(monotonic)),
         ):
             trade_workflow.before_submit_guard(deadline=deadline, **guard_kwargs)(
                 client, {"limit_price": Decimal("0.70"), "quantity": 3}
             )
 
-    def open_clock(self, minutes_to_close=120):
+    def open_clock(self, minutes_to_close=120, clock_age_minutes=0):
         now = datetime.now(timezone.utc)
-        return SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(minutes=minutes_to_close))
+        return SimpleNamespace(
+            is_open=True, timestamp=now - timedelta(minutes=clock_age_minutes),
+            next_close=now + timedelta(minutes=minutes_to_close),
+        )
 
     def test_the_guard_marks_only_timing_refusals_as_timing(self):
-        for label, clock, deadline, reason in (
-            ("time budget", self.open_clock(), 59, "order_time_budget_reached"),
-            ("market closed", SimpleNamespace(is_open=False), 10_000, "market_closed"),
-            ("pre-close cutoff", self.open_clock(minutes_to_close=2), 10_000, "close_cutoff_reached"),
+        for label, clock, deadline, monotonic, reason in (
+            ("time budget", self.open_clock(), 59, (0, 0), "order_time_budget_reached"),
+            ("time budget after broker calls", self.open_clock(), 180, (119, 121), "order_time_budget_reached"),
+            ("market closed", SimpleNamespace(is_open=False), 10_000, (0, 0), "market_closed"),
+            ("pre-close cutoff", self.open_clock(minutes_to_close=2), 10_000, (0, 0), "close_cutoff_reached"),
+            # The broker's clock was read 5 minutes ago; the local re-check catches the cutoff.
+            ("pre-close cutoff after broker calls", self.open_clock(minutes_to_close=2, clock_age_minutes=5), 10_000, (0, 0), "close_cutoff_reached"),
         ):
             with self.subTest(label):
                 with self.assertRaises(trade_workflow.SubmissionWindowClosed) as caught:
-                    self.guard_with_clock(clock, deadline)
+                    self.guard_with_clock(clock, deadline, monotonic)
                 self.assertEqual(caught.exception.stop_reason, reason)
+                self.assertIn(reason, trade_workflow.TIMING_STOP_REASONS)
                 # Outside an adapter it still fails closed.
                 self.assertIsInstance(caught.exception, trade_workflow.OperationalFailure)
 
@@ -500,7 +508,7 @@ class TimingRefusalTests(unittest.TestCase):
                     self.guard_with_clock(clock, **kwargs)
                 self.assertNotIsInstance(caught.exception, alpaca_integration.SubmissionTimingRefusal)
 
-    def test_an_open_that_meets_the_close_mid_chase_leaves_a_retryable_no_fill(self):
+    def test_an_open_that_meets_the_close_mid_chase_ends_without_failing_the_run(self):
         now = datetime.now(timezone.utc)
         client = paper_client()
         client.get_clock.side_effect = [
@@ -520,9 +528,24 @@ class TimingRefusalTests(unittest.TestCase):
                 stack.enter_context(patch.object(trade_workflow, name, value))
             open_one()
         self.assertEqual(len(submitted), 1)
-        result = mocks["mark_no_fill"].call_args.args[1]
+        result = mocks["finalize_execution"].call_args.args[1]
         self.assertEqual(result.stop_reason, "market_closed")
-        mocks["finalize_execution"].assert_called_once_with("trade-GOOD", result)
+        mocks["mark_no_fill"].assert_not_called()
+
+    def test_only_a_price_stop_makes_an_unfilled_open_retryable(self):
+        # A retry re-plans the trade, and orders already sent would then fail
+        # reconciliation against the new plan, so timing stops are not retried.
+        for reason, retryable in (
+            ("order_time_budget_reached", False),
+            ("market_closed", False),
+            ("close_cutoff_reached", False),
+            ("hard_price_limit_reached", True),
+        ):
+            unfilled = SimpleNamespace(filled_qty=0, remaining_qty=5, stop_reason=reason, attempts=())
+            with self.subTest(reason=reason), ExitStack() as stack:
+                mocks = candidate_patches(stack, place_calendar_spread_order=Mock(return_value=unfilled))
+                open_one()
+            self.assertEqual(mocks["mark_no_fill"].called, retryable)
 
     def test_a_due_close_stopped_by_timing_is_deferred_with_a_warning(self):
         trade = {

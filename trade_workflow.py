@@ -1359,7 +1359,10 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
         if not release_unfilled_open_plan(trade_id,"open_quote_validation_failed"): raise
         print(f"Skipping {ticker}: opening quotes became invalid before any fill: {redact(exc)}"); return
     finalize_execution(trade_id,result)
-    if int(dec(getattr(result,"filled_qty",0) or 0))==0: mark_no_fill(trade_id,result)
+    # A timing stop leaves the plan as submitted, as a failed run did, so a later
+    # run cannot re-plan it against the orders this chase already sent.
+    if int(dec(getattr(result,"filled_qty",0) or 0))==0 and getattr(result,"stop_reason","") not in TIMING_STOP_REASONS:
+        mark_no_fill(trade_id,result)
     print(f"Open result trade={trade_id} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',quantity)} stop_reason={getattr(result,'stop_reason','')}")
 
 
