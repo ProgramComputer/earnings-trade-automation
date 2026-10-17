@@ -248,6 +248,202 @@ class OpeningPriceCeilingTests(unittest.TestCase):
         self.assertEqual(self.ceiling_for("0"), (Decimal("0.35"), Decimal("0.40")))
 
 
+def snapshot(short_bid, short_ask, long_bid, long_ask):
+    return alpaca_integration.SpreadQuoteSnapshot(*(Decimal(value) for value in (short_bid, short_ask, long_bid, long_ask)))
+
+
+class EntryPricingTests(unittest.TestCase):
+    """Entries skip wide markets, step up in small increments, and may follow a rising ask a little."""
+
+    # The candidate is planned against a net 0.20 x 0.50 market: midpoint 0.35, ceiling 0.50.
+    PLANNED = snapshot("0.50", "0.60", "0.80", "1.00")
+    # The market then rises to net 0.30 x 0.70.
+    RISEN = snapshot("0.50", "0.60", "0.90", "1.20")
+
+    def chase(self, quotes, *, quantity=5, allocation=500_000, clock=None, **settings):
+        """Run one entry's real chase, where no order fills; return what was sent."""
+        now = datetime.now(timezone.utc)
+        client = paper_client()
+        client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+        sent = []
+
+        def submit(_client, request, client_order_id):
+            sent.append((Decimal(str(request.limit_price)), int(request.qty)))
+            return SimpleNamespace(id=f"order-{len(sent)}")
+
+        place = Mock(side_effect=alpaca_integration.place_calendar_spread_order)
+        output = io.StringIO()
+        with ExitStack() as stack:
+            mocks = candidate_patches(
+                stack, place_calendar_spread_order=place,
+                candidate_allocation=Mock(return_value=(quantity, allocation, 0, 10_000_000)),
+            )
+            chase_patches(stack, client)
+            fetch = Mock(side_effect=list(quotes)) if isinstance(quotes, list) else Mock(return_value=quotes)
+            stack.enter_context(patch.object(alpaca_integration, "_fetch_spread_quote_snapshot", fetch))
+            stack.enter_context(patch.object(alpaca_integration, "_submit_order_idempotently", Mock(side_effect=submit)))
+            for name, value in (
+                ("reconcile_broker_state", Mock()),
+                ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                ("exposure_cents", Mock(return_value=0)),
+                *settings.items(),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            if clock is not None:
+                clock(stack)
+            stack.enter_context(redirect_stdout(output))
+            open_one()
+        result = mocks["finalize_execution"].call_args.args[1] if mocks["finalize_execution"].called else None
+        return sent, result, place.call_args.kwargs if place.called else None, output.getvalue(), mocks
+
+    def test_an_entry_steps_a_tenth_of_the_market_width_at_a_time(self):
+        sent, result, _, _, _ = self.chase(self.PLANNED)
+        self.assertEqual(
+            [limit for limit, _ in sent],
+            [Decimal(price) for price in ("0.35", "0.38", "0.41", "0.44", "0.47", "0.50")],
+        )
+        self.assertEqual(result.stop_reason, "hard_price_limit_reached")
+
+    def test_the_ceiling_follows_a_rising_ask_up_to_its_margin(self):
+        sent, result, kwargs, _, _ = self.chase(
+            [self.PLANNED] + [self.RISEN] * 20, OPEN_CEILING_FOLLOW_PCT=Decimal("0.10"),
+        )
+        self.assertEqual(kwargs["target_debit_price"], Decimal("0.50"))
+        self.assertEqual(kwargs["max_debit_price"], Decimal("0.55"))
+        self.assertEqual(
+            [limit for limit, _ in sent],
+            [Decimal(price) for price in ("0.35", "0.39", "0.43", "0.47", "0.51", "0.55")],
+        )
+        self.assertEqual(result.stop_reason, "hard_price_limit_reached")
+
+    def test_a_quiet_market_is_never_paid_above_its_planned_ceiling(self):
+        for fraction, ceiling in (("1", "0.50"), ("0.5", "0.43")):
+            with self.subTest(fraction=fraction):
+                sent, _, _, _, _ = self.chase(
+                    self.PLANNED, OPEN_CEILING_FOLLOW_PCT=Decimal("0.25"),
+                    OPEN_MAX_DEBIT_SPREAD_FRACTION=Decimal(fraction),
+                )
+                self.assertEqual(max(limit for limit, _ in sent), Decimal(ceiling))
+
+    def test_a_higher_price_buys_fewer_contracts_within_the_position_budget(self):
+        # $250 buys 5 contracts at 0.50 but only 4 at 0.51 or 0.55.
+        sent, _, _, _, _ = self.chase(
+            [self.PLANNED] + [self.RISEN] * 20, allocation=25_000, OPEN_CEILING_FOLLOW_PCT=Decimal("0.10"),
+        )
+        self.assertEqual(sent[-1], (Decimal("0.55"), 4))
+        for limit, quantity in sent:
+            self.assertLessEqual(limit * quantity * 100, 250)
+
+    def test_the_logged_attempt_count_is_what_fits_in_the_time(self):
+        # Every price is new, so only time ends the chase. Each attempt waits
+        # out its timeout plus the measured second of broker calls.
+        now = {"seconds": 0.0}
+
+        def wait(_client, order_id, **kwargs):
+            now["seconds"] += kwargs["timeout"] + 1
+            return canceled_attempt(order_id, kwargs["expected_qty"])
+
+        def clock(stack):
+            stack.enter_context(patch.object(alpaca_integration.time, "monotonic", side_effect=lambda: now["seconds"]))
+            stack.enter_context(patch.object(alpaca_integration, "wait_for_fill", Mock(side_effect=wait)))
+            stack.enter_context(patch.object(alpaca_integration, "_chase_step", Mock(return_value=Decimal("0.01"))))
+
+        sent, result, kwargs, _, _ = self.chase(self.PLANNED, clock=clock)
+        self.assertEqual(len(sent), kwargs["max_attempts"])
+        self.assertIn(result.stop_reason, {"max_attempts_reached", "order_time_budget_reached"})
+
+    def test_opening_orders_wait_briefly_and_keep_room_to_cancel(self):
+        with ExitStack() as stack:
+            mocks = candidate_patches(stack)
+            open_one()
+        kwargs = mocks["place_calendar_spread_order"].call_args.kwargs
+        self.assertLessEqual(kwargs["attempt_timeout"], 10)
+        headroom = kwargs["attempt_timeout"] + kwargs["cancel_timeout"]
+        # open_one starts at 0 on the patched clock, so its orders must be admitted by 180 s.
+        deadline = kwargs["overall_timeout"]
+        for started, refused in ((deadline - headroom - 0.5, False), (deadline - headroom, True)):
+            with self.subTest(started=started), ExitStack() as stack:
+                client = Mock()
+                now = datetime.now(timezone.utc)
+                client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+                for name, value in (
+                    ("reconcile_broker_state", Mock()),
+                    ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                    ("exposure_cents", Mock(return_value=0)),
+                ):
+                    stack.enter_context(patch.object(trade_workflow, name, value))
+                stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=started))
+                guard = lambda: kwargs["before_submit"](client, {"limit_price": Decimal("0.50"), "quantity": 5})
+                if refused:
+                    with self.assertRaises(trade_workflow.SubmissionWindowClosed) as caught:
+                        guard()
+                    self.assertEqual(caught.exception.stop_reason, "order_time_budget_reached")
+                else:
+                    guard()
+
+    def test_the_guard_headroom_is_the_wait_plus_the_cancel_timeout(self):
+        timing = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_timeout": 30}
+        for started, refused in ((59.5, False), (60, True)):
+            with self.subTest(started=started), ExitStack() as stack:
+                client = Mock()
+                now = datetime.now(timezone.utc)
+                client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+                for name, value in (
+                    ("reconcile_broker_state", Mock()),
+                    ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                    ("exposure_cents", Mock(return_value=0)),
+                ):
+                    stack.enter_context(patch.object(trade_workflow, name, value))
+                stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=started))
+                guard = trade_workflow.before_submit_guard(deadline=100, order_timing=timing)
+                if refused:
+                    with self.assertRaises(trade_workflow.SubmissionWindowClosed):
+                        guard(client, {"limit_price": Decimal("0.50"), "quantity": 5})
+                else:
+                    guard(client, {"limit_price": Decimal("0.50"), "quantity": 5})
+
+    def test_a_deadline_without_its_order_timing_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "order timing"):
+            trade_workflow.before_submit_guard(deadline=100)
+
+    def test_a_market_wider_than_the_cap_is_skipped(self):
+        # 0.20 x 0.50 is 0.30 wide around a 0.35 midpoint: 86%.
+        sent, _, _, output, mocks = self.chase(self.PLANNED, OPEN_MAX_SPREAD_WIDTH_PCT=Decimal("0.75"))
+        self.assertEqual(sent, [])
+        mocks["create_planned_trade"].assert_not_called()
+        self.assertIn("Skipping GOOD: net market is wider than OPEN_MAX_SPREAD_WIDTH_PCT=0.75", output)
+
+    def test_a_market_within_the_cap_is_traded(self):
+        sent, _, _, output, _ = self.chase(self.PLANNED, OPEN_MAX_SPREAD_WIDTH_PCT=Decimal("0.90"))
+        self.assertTrue(sent)
+        self.assertIn("GOOD net market 0.20 x 0.50 is 86% wide at its midpoint.", output)
+
+    def test_no_width_cap_applies_unless_one_is_configured(self):
+        if os.environ.get("OPEN_MAX_SPREAD_WIDTH_PCT"):
+            self.skipTest("OPEN_MAX_SPREAD_WIDTH_PCT is set in this environment")
+        self.assertIsNone(trade_workflow.OPEN_MAX_SPREAD_WIDTH_PCT)
+        sent, _, _, _, _ = self.chase(snapshot("0.01", "1.00", "0.80", "1.00"), OPEN_MAX_SPREAD_WIDTH_PCT=None)
+        self.assertTrue(sent)
+
+    def test_invalid_entry_pricing_settings_are_refused_before_contacting_the_broker(self):
+        for name, value in (
+            ("OPEN_MAX_SPREAD_WIDTH_PCT", Decimal("0")),
+            ("OPEN_MAX_SPREAD_WIDTH_PCT", Decimal("NaN")),
+            ("OPEN_CEILING_FOLLOW_PCT", Decimal("0.5")),
+            ("OPEN_CEILING_FOLLOW_PCT", Decimal("-0.01")),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                patch.object(trade_workflow, name, value),
+                patch.object(trade_workflow, "configured_mode"),
+                patch.object(trade_workflow, "init_db"),
+                patch.object(trade_workflow, "configured_broker_client") as broker,
+            ):
+                with self.assertRaisesRegex(trade_workflow.OperationalFailure, name):
+                    trade_workflow.run_trade_workflow()
+            broker.assert_not_called()
+
+
 class ReleaseUnfilledOpenPlanTests(unittest.TestCase):
     def run_release(self, filled_quantity, active_order):
         original_path = trade_workflow.DB_PATH
@@ -587,9 +783,10 @@ class TimingRefusalTests(unittest.TestCase):
             # The guard reads the clock before and after its broker calls.
             patch.object(trade_workflow.time_module, "monotonic", side_effect=list(monotonic)),
         ):
-            trade_workflow.before_submit_guard(deadline=deadline, **guard_kwargs)(
-                client, {"limit_price": Decimal("0.70"), "quantity": 3}
-            )
+            # The cases below assume 60 s of headroom: a 30 s wait and a 30 s cancel.
+            trade_workflow.before_submit_guard(
+                deadline=deadline, order_timing={"attempt_timeout": 30, "cancel_timeout": 30}, **guard_kwargs
+            )(client, {"limit_price": Decimal("0.70"), "quantity": 3})
 
     def open_clock(self, minutes_to_close=120, clock_age_minutes=0):
         now = datetime.now(timezone.utc)

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -11,7 +12,7 @@ import time as time_module
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -54,6 +55,18 @@ ENTRY_WINDOW_MINUTES = int(os.environ.get("ENTRY_WINDOW_MINUTES") or "240")
 # order may pay. The chase still starts at the midpoint; 1 allows the natural
 # price, and Alpaca PAPER has not filled spreads below it.
 OPEN_MAX_DEBIT_SPREAD_FRACTION = Decimal(os.environ.get("OPEN_MAX_DEBIT_SPREAD_FRACTION") or "1")
+# Widest net market an entry accepts, as (net ask - net bid) / midpoint; 0.75
+# means 75%. Unset accepts any width: every entry filled from August to
+# October 2026 was at least 30% wide, so a tight cap stops all trading.
+OPEN_MAX_SPREAD_WIDTH_PCT = Decimal(os.environ["OPEN_MAX_SPREAD_WIDTH_PCT"]) if os.environ.get("OPEN_MAX_SPREAD_WIDTH_PCT") else None
+# An opening chase may follow a rising ask up to this share above the
+# planning-time ceiling, still within the position and exposure limits.
+OPEN_CEILING_FOLLOW_PCT = Decimal(os.environ.get("OPEN_CEILING_FOLLOW_PCT") or "0.05")
+# Alpaca PAPER filled 7 of the 8 filled entries within 0.25 s of submission
+# (LEVI took 10 s), so an opening price waits briefly before the next step.
+OPEN_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_timeout": 30}
+# Quotes, the submit guard, submission and cancel confirmation add 0.4-1.1 s.
+ORDER_ATTEMPT_OVERHEAD_SECONDS = 1
 UUID_NAMESPACE = uuid.UUID("f8eaa5b8-685f-4d83-9308-b426ad5f95a1")
 KNOWN_DEBITS = {"DG", "ORCL", "NKE"}
 KNOWN_SINGLE_CREDITS = {"CHPT", "LULU", "DRI", "KMX", "KR", "KMI"}
@@ -923,11 +936,26 @@ def exposure_cents():
     return total
 
 
-def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_debit=True, deadline=None):
+def submission_headroom(order_timing):
+    """Run time an admitted order needs to be waited on and cancel-confirmed."""
+    return order_timing["attempt_timeout"]+order_timing["cancel_timeout"]
+
+
+def chase_attempts(order_timing):
+    """How many attempts fit before the submit guard stops admitting orders."""
+    window=order_timing["overall_timeout"]-submission_headroom(order_timing)
+    return max(1,math.ceil(window/(order_timing["attempt_timeout"]+ORDER_ATTEMPT_OVERHEAD_SECONDS)))
+
+
+def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_debit=True, deadline=None, order_timing=None):
+    """Check limits before each order; ``order_timing`` is the adapter's timeouts."""
+    if deadline is not None and order_timing is None:
+        raise ValueError("A submission deadline needs the order timing that sets its headroom")
+    headroom=None if order_timing is None else submission_headroom(order_timing)
     def guard(client,context):
         # Timing refusals end the chase like a price limit; the adapter stops
         # with no live order. Every other refusal still fails the run.
-        if deadline is not None and time_module.monotonic()+60 >= deadline:
+        if deadline is not None and time_module.monotonic()+headroom >= deadline:
             raise SubmissionWindowClosed("Insufficient run time remains to submit and cancel-confirm an order safely","order_time_budget_reached")
         reconcile_broker_state(client,read_only=True)
         try: clock=client.get_clock()
@@ -958,7 +986,7 @@ def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_deb
         # allowed to submit a physical order.
         if isinstance(next_close,datetime) and datetime.now(timezone.utc)>=next_close-timedelta(minutes=3):
             raise SubmissionWindowClosed("Order submission cutoff reached before market close","close_cutoff_reached")
-        if deadline is not None and time_module.monotonic()+60>=deadline:
+        if deadline is not None and time_module.monotonic()+headroom>=deadline:
             raise SubmissionWindowClosed("Insufficient run time remains to submit and cancel-confirm an order safely","order_time_budget_reached")
     return guard
 
@@ -1266,7 +1294,7 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
                   on_terminal=lambda event,tid=tid:record_fill(tid,"close","calendar_spread",event,"scheduled_post_earnings_close"),
                   on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
                   on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","calendar_spread",order,{**context,"submission_only":True}),
-                  before_submit=before_submit_guard(close_requires_debit=True,deadline=operation_deadline),
+                  before_submit=before_submit_guard(close_requires_debit=True,deadline=operation_deadline,order_timing=common),
                   client_order_id_prefix=prefix,**common)
             elif state=="SHORT_EXPIRED_LONG_REMAINS":
                 method="single_long_sell"
@@ -1275,7 +1303,7 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
                   on_terminal=lambda event,tid=tid:record_fill(tid,"close","single_long_sell",event,"confirmed_short_expiry_long_leg_sale"),
                   on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","single_long_sell",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
                   on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","single_long_sell",order,{**context,"submission_only":True}),
-                  before_submit=before_submit_guard(close_requires_debit=False,deadline=operation_deadline),
+                  before_submit=before_submit_guard(close_requires_debit=False,deadline=operation_deadline,order_timing=common),
                   client_order_id_prefix=prefix,**common)
             else: raise ReconciliationFailure(f"Trade {tid} has no safe close path")
         except QuoteValidationError as exc:
@@ -1329,6 +1357,21 @@ def position_allocation():
     return allocation,f"{fraction} x full Kelly {full_kelly:.4f} = {allocation:.4f} of equity"
 
 
+def spread_width(net_bid,net_ask):
+    """The net market's width as a share of its midpoint, or None without a positive midpoint."""
+    midpoint=(net_bid+net_ask)/2
+    return (net_ask-net_bid)/midpoint if midpoint>0 else None
+
+
+def opening_prices(net_bid,net_ask):
+    """Return an opening's starting price (the midpoint) and its debit ceiling for this market."""
+    midpoint=((net_bid+net_ask)/2).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+    if midpoint<=0: midpoint=Decimal("0.01")
+    slippage=Decimal(os.environ.get("OPEN_MAX_DEBIT_SLIPPAGE", "0.05"))
+    allowance=max(slippage,OPEN_MAX_DEBIT_SPREAD_FRACTION*(net_ask-midpoint),Decimal(0))
+    return midpoint,min(net_ask,midpoint+allowance).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+
+
 def candidate_allocation(client,spread_cost):
     equity,buying=account_snapshot(client); existing=exposure_cents()
     cap=dollars_to_cents(equity*MAX_AGGREGATE_EXPOSURE_PCT)
@@ -1372,13 +1415,14 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline,*,ex
     net_bid=long_bid-short_ask; net_ask=long_ask-short_bid
     if net_ask<=0 or net_bid>net_ask:
         print(f"Skipping {ticker}: invalid net spread market bid={net_bid} ask={net_ask}"); return
-    midpoint=((net_bid+net_ask)/2).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
-    if midpoint<=0: midpoint=Decimal("0.01")
-    slippage=Decimal(os.environ.get("OPEN_MAX_DEBIT_SLIPPAGE", "0.05"))
-    allowance=max(slippage,OPEN_MAX_DEBIT_SPREAD_FRACTION*(net_ask-midpoint),Decimal(0))
-    target_debit=min(net_ask,midpoint+allowance).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
+    width=spread_width(net_bid,net_ask)
+    print(f"{ticker} net market {net_bid} x {net_ask} is {'unpriced' if width is None else format(width,'.0%')} wide at its midpoint.")
+    if OPEN_MAX_SPREAD_WIDTH_PCT is not None and (width is None or width>OPEN_MAX_SPREAD_WIDTH_PCT):
+        print(f"Skipping {ticker}: net market is wider than OPEN_MAX_SPREAD_WIDTH_PCT={OPEN_MAX_SPREAD_WIDTH_PCT} of its midpoint"); return
+    midpoint,target_debit=opening_prices(net_bid,net_ask)
     if target_debit<=0:
         print(f"Skipping {ticker}: no positive hard debit ceiling"); return
+    max_debit=(target_debit*(1+OPEN_CEILING_FOLLOW_PCT)).quantize(Decimal("0.01"),rounding=ROUND_FLOOR)
     quantity,allocation,existing,cap=candidate_allocation(client,target_debit)
     if quantity<1:
         print(f"Skipping {ticker}: aggregate exposure cap reached (existing=${existing/100:.2f}, cap=${cap/100:.2f})"); return
@@ -1389,15 +1433,16 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline,*,ex
     if plan_status=="skipped": return
     print(f"Trade plan {trade_id}: {plan_status} with ordered quantity {quantity}.")
     prefix=reserve_operation_prefix(trade_id,"open","calendar_spread")
-    operation_deadline=min(time_module.monotonic()+180,run_deadline)
+    operation_deadline=min(time_module.monotonic()+OPEN_ORDER_TIMING["overall_timeout"],run_deadline)
     try:
         result=place_calendar_spread_order(short_symbol,long_symbol,quantity,limit_price=midpoint,
-          target_debit_price=target_debit,max_total_cost_allowed=Decimal(allocation)/100,
+          target_debit_price=target_debit,max_debit_price=max_debit,
+          debit_ceiling_for=lambda bid,ask:opening_prices(bid,ask)[1],max_total_cost_allowed=Decimal(allocation)/100,
           on_terminal=lambda event,tid=trade_id:record_fill(tid,"open","calendar_spread",event),
           on_order_state=lambda event,tid=trade_id:persist_unpriced_order_state(tid,"open","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
           on_submitted=lambda order,context,tid=trade_id:upsert_submitted_order(tid,"open","calendar_spread",order,{**context,"submission_only":True}),
-          before_submit=before_submit_guard(allocation,opening=True,deadline=operation_deadline),max_attempts=8,overall_timeout=180,attempt_timeout=30,cancel_timeout=30,
-          client_order_id_prefix=prefix)
+          before_submit=before_submit_guard(allocation,opening=True,deadline=operation_deadline,order_timing=OPEN_ORDER_TIMING),
+          max_attempts=chase_attempts(OPEN_ORDER_TIMING),**OPEN_ORDER_TIMING,client_order_id_prefix=prefix)
     except QuoteValidationError as exc:
         # Only a plan with no fill and no live order is safe to leave behind.
         if not release_unfilled_open_plan(trade_id,"open_quote_validation_failed"): raise
@@ -1426,6 +1471,10 @@ def run_trade_workflow():
         raise OperationalFailure("ENTRY_WINDOW_MINUTES must be greater than 3 and no more than 390")
     if not Decimal(0)<=OPEN_MAX_DEBIT_SPREAD_FRACTION<=Decimal(1):
         raise OperationalFailure("OPEN_MAX_DEBIT_SPREAD_FRACTION must be between zero and one")
+    if OPEN_MAX_SPREAD_WIDTH_PCT is not None and not (OPEN_MAX_SPREAD_WIDTH_PCT.is_finite() and OPEN_MAX_SPREAD_WIDTH_PCT>0):
+        raise OperationalFailure("OPEN_MAX_SPREAD_WIDTH_PCT must be greater than zero, or unset to accept any width")
+    if not (OPEN_CEILING_FOLLOW_PCT.is_finite() and Decimal(0)<=OPEN_CEILING_FOLLOW_PCT<=Decimal("0.25")):
+        raise OperationalFailure("OPEN_CEILING_FOLLOW_PCT must be between zero and 0.25")
     if not 0<DEFAULT_QUOTE_MAX_AGE_SECONDS<=900:
         raise OperationalFailure("QUOTE_MAX_AGE_SECONDS must be greater than zero and no more than 900")
     client,broker_mode=configured_broker_client()
