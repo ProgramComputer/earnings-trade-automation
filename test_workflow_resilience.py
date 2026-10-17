@@ -53,7 +53,7 @@ def candidate_patches(stack, **overrides):
 def open_one(ticker="GOOD"):
     return trade_workflow.open_candidate(
         object(), {"act_symbol": ticker}, "AMC", date(2026, 9, 30),
-        datetime(2026, 9, 30, 16, 0, tzinfo=EASTERN), 10_000,
+        datetime(2026, 9, 30, 16, 0, tzinfo=EASTERN), 10_000, exit_date=date(2026, 10, 1),
     )
 
 
@@ -108,6 +108,123 @@ class CandidateIsolationTests(unittest.TestCase):
             )
             with self.assertRaises(alpaca_integration.QuoteValidationError):
                 open_one()
+
+
+class ShortExpiryTests(unittest.TestCase):
+    """The short leg must expire after the session the position is due to close.
+
+    On 2026-10-16 the short legs of CFG and RF (BMO) and of AA and IBKR (AMC)
+    expired the day they were closed.
+    """
+
+    def entry_run(self, now, next_open, record, expiries, **overrides):
+        """Run one afternoon's openings against a chain of expiries; return the order call."""
+        class Session(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz else now
+
+        chain = {expiry: {10.0: {"call": SimpleNamespace(symbol=f"XYZ {expiry}")}} for expiry in expiries}
+        stock_client = Mock()
+        stock_client.get_stock_latest_bar.return_value = {"XYZ": SimpleNamespace(close=10.02)}
+        clock = SimpleNamespace(
+            next_close=Session(now.year, now.month, now.day, 16, 0, tzinfo=EASTERN),
+            next_open=Session(next_open.year, next_open.month, next_open.day, 9, 30, tzinfo=EASTERN),
+        )
+        bmo = record["when"].startswith("Before")
+        output = io.StringIO()
+        with ExitStack() as stack:
+            mocks = candidate_patches(
+                stack, get_alpaca_option_chain=Mock(return_value=chain),
+                select_expiries_and_strike_alpaca=alpaca_integration.select_expiries_and_strike_alpaca,
+                **overrides,
+            )
+            stack.enter_context(patch("alpaca.data.historical.StockHistoricalDataClient", Mock(return_value=stock_client)))
+            for target, name, value in (
+                (alpaca_integration, "get_alpaca_option_chain", Mock(return_value=chain)),
+                (trade_workflow, "datetime", Session),
+                (trade_workflow, "get_todays_earnings", Mock(return_value=[] if bmo else [record])),
+                (trade_workflow, "get_tomorrows_earnings", Mock(return_value=[record] if bmo else [])),
+            ):
+                stack.enter_context(patch.object(target, name, value))
+            stack.enter_context(kelly_inputs())
+            stack.enter_context(redirect_stdout(output))
+            trade_workflow.open_new_positions(object(), clock, 10_000)
+        return mocks, output.getvalue()
+
+    def legs(self, mocks):
+        mocks["place_calendar_spread_order"].assert_called_once()
+        return tuple(mocks["place_calendar_spread_order"].call_args.args[:2])
+
+    # Thursday 2026-10-15 at 2:10 pm; the next session is Friday 2026-10-16.
+    THURSDAY = datetime(2026, 10, 15, 14, 10, tzinfo=EASTERN)
+    FRIDAY = date(2026, 10, 16)
+    WEEKLIES = ("2026-10-16", "2026-10-23", "2026-11-13", "2026-11-20", "2026-11-27")
+
+    def test_a_bmo_short_leg_expires_after_the_earnings_day_exit(self):
+        mocks, _ = self.entry_run(
+            self.THURSDAY, self.FRIDAY, {"act_symbol": "XYZ", "when": "Before market open"}, self.WEEKLIES,
+        )
+        self.assertEqual(mocks["is_time_to_open"].call_args.args[:2], (self.FRIDAY, "BMO"))
+        # The long leg stays about 30 days after the new short expiry.
+        self.assertEqual(self.legs(mocks), ("XYZ 2026-10-23", "XYZ 2026-11-20"))
+
+    def test_an_amc_short_leg_expires_after_the_next_session_exit(self):
+        mocks, _ = self.entry_run(
+            self.THURSDAY, self.FRIDAY, {"act_symbol": "XYZ", "when": "After market close"}, self.WEEKLIES,
+        )
+        self.assertEqual(mocks["is_time_to_open"].call_args.args[:2], (date(2026, 10, 15), "AMC"))
+        self.assertEqual(self.legs(mocks), ("XYZ 2026-10-23", "XYZ 2026-11-20"))
+
+    def test_a_friday_amc_short_leg_expires_after_the_monday_exit(self):
+        mocks, _ = self.entry_run(
+            datetime(2026, 10, 16, 14, 10, tzinfo=EASTERN), date(2026, 10, 19),
+            {"act_symbol": "XYZ", "when": "After market close"},
+            ("2026-10-16", "2026-10-19", "2026-10-23", "2026-11-20", "2026-11-27"),
+        )
+        self.assertEqual(self.legs(mocks), ("XYZ 2026-10-23", "XYZ 2026-11-20"))
+
+    def test_no_expiry_after_the_exit_skips_the_candidate(self):
+        mocks, output = self.entry_run(
+            self.THURSDAY, self.FRIDAY, {"act_symbol": "XYZ", "when": "Before market open"}, ("2026-10-16",),
+            select_yahoo=Mock(return_value=(None, None, None)),
+        )
+        mocks["create_planned_trade"].assert_not_called()
+        mocks["place_calendar_spread_order"].assert_not_called()
+        self.assertIn("Skipping XYZ: no short expiry after the 2026-10-16 exit session", output)
+
+    def test_the_yahoo_fallback_also_starts_after_the_exit(self):
+        yahoo = Mock(return_value=("2026-10-23", "2026-11-20", 10.0))
+        chain = {
+            "2026-10-23": {10.0: {"call": SimpleNamespace(symbol="SHORT")}},
+            "2026-11-20": {10.0: {"call": SimpleNamespace(symbol="LONG")}},
+        }
+        with ExitStack() as stack:
+            mocks = candidate_patches(
+                stack, select_expiries_and_strike_alpaca=Mock(return_value=(None, None, None)),
+                select_yahoo=yahoo, get_alpaca_option_chain=Mock(return_value=chain),
+            )
+            stack.enter_context(patch.object(trade_workflow.yf, "Ticker"))
+            trade_workflow.open_candidate(
+                object(), {"act_symbol": "XYZ"}, "BMO", self.FRIDAY,
+                datetime(2026, 10, 15, 16, 0, tzinfo=EASTERN), 10_000, exit_date=self.FRIDAY,
+            )
+        self.assertEqual(yahoo.call_args.args[1], self.FRIDAY)
+        mocks["place_calendar_spread_order"].assert_called_once()
+
+    def test_a_short_expiring_on_the_exit_day_is_never_sold(self):
+        output = io.StringIO()
+        with ExitStack() as stack:
+            mocks = candidate_patches(
+                stack, select_expiries_and_strike_alpaca=Mock(return_value=("2026-10-16", "2026-11-13", 10.0)),
+            )
+            stack.enter_context(redirect_stdout(output))
+            trade_workflow.open_candidate(
+                object(), {"act_symbol": "XYZ"}, "BMO", self.FRIDAY,
+                datetime(2026, 10, 15, 16, 0, tzinfo=EASTERN), 10_000, exit_date=self.FRIDAY,
+            )
+        mocks["place_calendar_spread_order"].assert_not_called()
+        self.assertIn("short expiry 2026-10-16 is not after the 2026-10-16 exit session", output.getvalue())
 
 
 class OpeningPriceCeilingTests(unittest.TestCase):
@@ -713,7 +830,8 @@ class ReplannedOpenTests(unittest.TestCase):
             kwargs["terminal_state_callback"](result)
             return result
 
-        chain = {"short": {10.0: {"call": SimpleNamespace(symbol=short)}}, "long": {10.0: {"call": SimpleNamespace(symbol=long)}}}
+        expiries = tuple(trade_workflow.option_expiration(symbol).isoformat() for symbol in contracts)
+        chain = {expiry: {10.0: {"call": SimpleNamespace(symbol=symbol)}} for expiry, symbol in zip(expiries, contracts)}
         quotes = alpaca_integration.SpreadQuoteSnapshot(Decimal("0.50"), Decimal("0.60"), Decimal("0.80"), Decimal("1.00"))
         with ExitStack() as stack:
             for name, value in (
@@ -726,7 +844,7 @@ class ReplannedOpenTests(unittest.TestCase):
             for name, value in (
                 ("is_time_to_open", Mock(return_value=True)),
                 ("compute_recommendation", Mock(return_value={"avg_volume": True, "iv30_rv30": True, "ts_slope_0_45": True})),
-                ("select_expiries_and_strike_alpaca", Mock(return_value=("short", "long", 10.0))),
+                ("select_expiries_and_strike_alpaca", Mock(return_value=(*expiries, 10.0))),
                 ("get_alpaca_option_chain", Mock(return_value=chain)),
                 ("get_spread_quotes", Mock(return_value=("0.50", "0.60", "0.80", "1.00"))),
                 ("candidate_allocation", Mock(return_value=(quantity, 1_000_000, 0, 10_000_000))),
@@ -738,7 +856,7 @@ class ReplannedOpenTests(unittest.TestCase):
             stack.enter_context(redirect_stdout(io.StringIO()))
             trade_workflow.open_candidate(
                 client, {"act_symbol": "XYZ"}, "AMC", date(2026, 10, 19),
-                datetime(2026, 10, 19, 16, 0, tzinfo=EASTERN), 10_000,
+                datetime(2026, 10, 19, 16, 0, tzinfo=EASTERN), 10_000, exit_date=date(2026, 10, 20),
             )
 
     def trade(self):

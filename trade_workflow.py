@@ -1178,10 +1178,10 @@ def is_time_to_close(earnings_date,when):
     return datetime.now(EASTERN)>=datetime.combine(day,time(9,40),tzinfo=EASTERN)
 
 
-def select_yahoo(stock,earnings_date):
+def select_yahoo(stock,short_after):
     try:
         expirations=sorted(datetime.strptime(item,"%Y-%m-%d").date() for item in stock.options)
-        short=next((item for item in expirations if item>earnings_date),None)
+        short=next((item for item in expirations if item>short_after),None)
         long=min((item for item in expirations if short and item>short),key=lambda item:abs((item-short).days-30),default=None)
         if not short or not long: return None,None,None
         underlying=stock.history(period="1d")["Close"].iloc[0]
@@ -1306,7 +1306,8 @@ def candidate_allocation(client,spread_cost):
     return (allocation//cost if cost else 0),allocation,existing,cap
 
 
-def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
+def open_candidate(client,item,when,earnings_date,market_close,run_deadline,*,exit_date):
+    """Open one candidate; ``exit_date`` is the session its position is due to close."""
     if time_module.monotonic()+60>=run_deadline:
         raise RunTimeBudgetReached("Run time budget reached before candidate processing")
     ticker=str(item["act_symbol"]).upper()
@@ -1315,12 +1316,15 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
     recommendation=compute_recommendation(ticker)
     if not (isinstance(recommendation,dict) and recommendation.get("avg_volume") and recommendation.get("iv30_rv30") and recommendation.get("ts_slope_0_45")):
         print(f"Skipping {ticker}: strategy screening thresholds were not all satisfied."); return
-    filter_date=earnings_date-timedelta(days=1) if when=="BMO" else earnings_date
-    short_expiry,long_expiry,strike=select_expiries_and_strike_alpaca(ticker,filter_date)
+    # A short leg that expires on the exit session can be assigned into stock
+    # if that session's close does not run, so it must expire after it.
+    short_expiry,long_expiry,strike=select_expiries_and_strike_alpaca(ticker,exit_date)
     if not short_expiry or not long_expiry or strike is None:
-        short_expiry,long_expiry,strike=select_yahoo(yf.Ticker(ticker),filter_date)
+        short_expiry,long_expiry,strike=select_yahoo(yf.Ticker(ticker),exit_date)
     if not short_expiry or not long_expiry or strike is None:
-        print(f"Skipping {ticker}: expiries or strike unavailable"); return
+        print(f"Skipping {ticker}: no short expiry after the {exit_date} exit session with a later long expiry and a strike"); return
+    if datetime.strptime(short_expiry,"%Y-%m-%d").date()<=exit_date:
+        print(f"Skipping {ticker}: short expiry {short_expiry} is not after the {exit_date} exit session"); return
     chain=get_alpaca_option_chain(ticker)
     if not chain:
         print(f"Skipping {ticker}: option chain unavailable"); return
@@ -1433,11 +1437,12 @@ def open_new_positions(client,clock,run_deadline):
     if not isinstance(todays,list) or not isinstance(tomorrows,list): raise OperationalFailure("Earnings source returned invalid data")
     print(f"Earnings source returned {len(todays)} current-session and {len(tomorrows)} next-session records.")
     try:
+        # BMO and AMC positions both close in the next session.
         for item in tomorrows:
-            if "before" in str(item.get("when") or "").lower(): open_candidate(client,item,"BMO",next_session_date,market_close,run_deadline)
+            if "before" in str(item.get("when") or "").lower(): open_candidate(client,item,"BMO",next_session_date,market_close,run_deadline,exit_date=next_session_date)
             elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: next-session record is not BMO.")
         for item in todays:
-            if "after" in str(item.get("when") or "").lower(): open_candidate(client,item,"AMC",now.date(),market_close,run_deadline)
+            if "after" in str(item.get("when") or "").lower(): open_candidate(client,item,"AMC",now.date(),market_close,run_deadline,exit_date=next_session_date)
             elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: current-session record is not AMC.")
     except RunTimeBudgetReached as exc:
         print(f"{exc}; remaining candidates skipped.")
