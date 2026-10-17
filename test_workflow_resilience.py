@@ -136,7 +136,7 @@ def snapshot(short_bid, short_ask, long_bid, long_ask):
 
 
 class EntryPricingTests(unittest.TestCase):
-    """Entries step up in small increments and may follow a rising ask a little."""
+    """Entries skip wide markets, step up in small increments, and may follow a rising ask a little."""
 
     # The candidate is planned against a net 0.20 x 0.50 market: midpoint 0.35, ceiling 0.50.
     PLANNED = snapshot("0.50", "0.60", "0.80", "1.00")
@@ -289,8 +289,29 @@ class EntryPricingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "order timing"):
             trade_workflow.before_submit_guard(deadline=100)
 
+    def test_a_market_wider_than_the_cap_is_skipped(self):
+        # 0.20 x 0.50 is 0.30 wide around a 0.35 midpoint: 86%.
+        sent, _, _, output, mocks = self.chase(self.PLANNED, OPEN_MAX_SPREAD_WIDTH_PCT=Decimal("0.75"))
+        self.assertEqual(sent, [])
+        mocks["create_planned_trade"].assert_not_called()
+        self.assertIn("Skipping GOOD: net market is wider than OPEN_MAX_SPREAD_WIDTH_PCT=0.75", output)
+
+    def test_a_market_within_the_cap_is_traded(self):
+        sent, _, _, output, _ = self.chase(self.PLANNED, OPEN_MAX_SPREAD_WIDTH_PCT=Decimal("0.90"))
+        self.assertTrue(sent)
+        self.assertIn("GOOD net market 0.20 x 0.50 is 86% wide at its midpoint.", output)
+
+    def test_no_width_cap_applies_unless_one_is_configured(self):
+        if os.environ.get("OPEN_MAX_SPREAD_WIDTH_PCT"):
+            self.skipTest("OPEN_MAX_SPREAD_WIDTH_PCT is set in this environment")
+        self.assertIsNone(trade_workflow.OPEN_MAX_SPREAD_WIDTH_PCT)
+        sent, _, _, _, _ = self.chase(snapshot("0.01", "1.00", "0.80", "1.00"), OPEN_MAX_SPREAD_WIDTH_PCT=None)
+        self.assertTrue(sent)
+
     def test_invalid_entry_pricing_settings_are_refused_before_contacting_the_broker(self):
         for name, value in (
+            ("OPEN_MAX_SPREAD_WIDTH_PCT", Decimal("0")),
+            ("OPEN_MAX_SPREAD_WIDTH_PCT", Decimal("NaN")),
             ("OPEN_CEILING_FOLLOW_PCT", Decimal("0.5")),
             ("OPEN_CEILING_FOLLOW_PCT", Decimal("-0.01")),
         ):

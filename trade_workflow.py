@@ -55,6 +55,10 @@ ENTRY_WINDOW_MINUTES = int(os.environ.get("ENTRY_WINDOW_MINUTES") or "240")
 # order may pay. The chase still starts at the midpoint; 1 allows the natural
 # price, and Alpaca PAPER has not filled spreads below it.
 OPEN_MAX_DEBIT_SPREAD_FRACTION = Decimal(os.environ.get("OPEN_MAX_DEBIT_SPREAD_FRACTION") or "1")
+# Widest net market an entry accepts, as (net ask - net bid) / midpoint; 0.75
+# means 75%. Unset accepts any width: every entry filled from August to
+# October 2026 was at least 30% wide, so a tight cap stops all trading.
+OPEN_MAX_SPREAD_WIDTH_PCT = Decimal(os.environ["OPEN_MAX_SPREAD_WIDTH_PCT"]) if os.environ.get("OPEN_MAX_SPREAD_WIDTH_PCT") else None
 # An opening chase may follow a rising ask up to this share above the
 # planning-time ceiling, still within the position and exposure limits.
 OPEN_CEILING_FOLLOW_PCT = Decimal(os.environ.get("OPEN_CEILING_FOLLOW_PCT") or "0.05")
@@ -1321,6 +1325,12 @@ def position_allocation():
     return allocation,f"{fraction} x full Kelly {full_kelly:.4f} = {allocation:.4f} of equity"
 
 
+def spread_width(net_bid,net_ask):
+    """The net market's width as a share of its midpoint, or None without a positive midpoint."""
+    midpoint=(net_bid+net_ask)/2
+    return (net_ask-net_bid)/midpoint if midpoint>0 else None
+
+
 def opening_prices(net_bid,net_ask):
     """Return an opening's starting price (the midpoint) and its debit ceiling for this market."""
     midpoint=((net_bid+net_ask)/2).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
@@ -1369,6 +1379,10 @@ def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
     net_bid=long_bid-short_ask; net_ask=long_ask-short_bid
     if net_ask<=0 or net_bid>net_ask:
         print(f"Skipping {ticker}: invalid net spread market bid={net_bid} ask={net_ask}"); return
+    width=spread_width(net_bid,net_ask)
+    print(f"{ticker} net market {net_bid} x {net_ask} is {'unpriced' if width is None else format(width,'.0%')} wide at its midpoint.")
+    if OPEN_MAX_SPREAD_WIDTH_PCT is not None and (width is None or width>OPEN_MAX_SPREAD_WIDTH_PCT):
+        print(f"Skipping {ticker}: net market is wider than OPEN_MAX_SPREAD_WIDTH_PCT={OPEN_MAX_SPREAD_WIDTH_PCT} of its midpoint"); return
     midpoint,target_debit=opening_prices(net_bid,net_ask)
     if target_debit<=0:
         print(f"Skipping {ticker}: no positive hard debit ceiling"); return
@@ -1421,6 +1435,8 @@ def run_trade_workflow():
         raise OperationalFailure("ENTRY_WINDOW_MINUTES must be greater than 3 and no more than 390")
     if not Decimal(0)<=OPEN_MAX_DEBIT_SPREAD_FRACTION<=Decimal(1):
         raise OperationalFailure("OPEN_MAX_DEBIT_SPREAD_FRACTION must be between zero and one")
+    if OPEN_MAX_SPREAD_WIDTH_PCT is not None and not (OPEN_MAX_SPREAD_WIDTH_PCT.is_finite() and OPEN_MAX_SPREAD_WIDTH_PCT>0):
+        raise OperationalFailure("OPEN_MAX_SPREAD_WIDTH_PCT must be greater than zero, or unset to accept any width")
     if not (OPEN_CEILING_FOLLOW_PCT.is_finite() and Decimal(0)<=OPEN_CEILING_FOLLOW_PCT<=Decimal("0.25")):
         raise OperationalFailure("OPEN_CEILING_FOLLOW_PCT must be between zero and 0.25")
     if not 0<DEFAULT_QUOTE_MAX_AGE_SECONDS<=900:
