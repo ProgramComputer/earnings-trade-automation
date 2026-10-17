@@ -131,7 +131,7 @@ jobs:
           echo "Validated workflow mode: ${RUN_MODE}."
 
       - name: Set up Python 3.10
-        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only'
+        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only' || steps.market.outputs.run_mode == 'market-closed'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -139,7 +139,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only'
+        if: steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only' || steps.market.outputs.run_mode == 'market-closed'
         shell: bash
         run: |
           set -euo pipefail
@@ -236,14 +236,17 @@ jobs:
 
       - name: Sync optional Sheet outbox
         id: sheet_sync
-        if: always() && steps.market.outputs.run_mode == 'paper-trade'
+        # Market-closed runs sync too; the sync never contacts Alpaca.
+        if: always() && (steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'market-closed')
         continue-on-error: true
+        # Above the code's SHEET_SYNC_SECONDS budget.
+        timeout-minutes: 10
         shell: bash
         run: python trade_workflow.py --sync-sheet
 
       - name: Commit durable ledger updates
         id: persist
-        if: always() && (steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only') && hashFiles('trades.db') != ''
+        if: always() && (steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'reconcile-only' || steps.market.outputs.run_mode == 'market-closed') && hashFiles('trades.db') != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -294,35 +297,52 @@ jobs:
           retention-days: 30
 
       - name: Report optional Sheet synchronization
-        if: always() && steps.market.outputs.run_mode == 'paper-trade' && hashFiles('trades.db') != ''
+        if: always() && (steps.market.outputs.run_mode == 'paper-trade' || steps.market.outputs.run_mode == 'market-closed') && hashFiles('trades.db') != ''
         shell: bash
         env:
           SHEET_SYNC_OUTCOME: ${{ steps.sheet_sync.outcome }}
         run: |
           python - <<'PY'
           import os, re, sqlite3
+          from datetime import datetime, timezone
           outcome = os.environ.get("SHEET_SYNC_OUTCOME", "unknown")
           try:
               with sqlite3.connect("file:trades.db?mode=ro", uri=True) as database:
-                  total, synced, pending = database.execute("""SELECT COUNT(*),
-                    COALESCE(SUM(state='synced'),0), COALESCE(SUM(state!='synced'),0)
+                  total, synced, pending, oldest = database.execute("""SELECT COUNT(*),
+                    COALESCE(SUM(state='synced'),0), COALESCE(SUM(state!='synced'),0),
+                    MIN(CASE WHEN state!='synced' THEN created_at END)
                     FROM sheet_outbox""").fetchone()
                   row = database.execute("""SELECT last_error FROM sheet_outbox
                     WHERE state!='synced' ORDER BY updated_at DESC LIMIT 1""").fetchone()
               latest_error = "none" if not row else " ".join(str(row[0] or "not recorded").split())[:240]
           except sqlite3.Error:
               total = synced = pending = "unknown"
+              oldest = None
               latest_error = "outbox status unavailable"
+
+          waited = "nothing pending" if pending == 0 else "unknown"
+          if oldest:
+              try:
+                  queued_at = datetime.fromisoformat(oldest)
+                  if queued_at.tzinfo is None:
+                      queued_at = queued_at.replace(tzinfo=timezone.utc)
+                  minutes = max(0, int((datetime.now(timezone.utc) - queued_at).total_seconds() // 60))
+                  days, minutes = divmod(minutes, 24 * 60)
+                  waited = f"{days}d {minutes // 60}h" if days else f"{minutes // 60}h {minutes % 60}m"
+              except ValueError:
+                  pass
 
           latest_error = re.sub(r"https?://\S+", "[URL REDACTED]", latest_error).replace("`", "'")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
               output.write("### Optional Google Sheet synchronization\n\n")
               output.write(f"- Command outcome: `{outcome}`\n")
               output.write(f"- Outbox: {total} total, {synced} synced, {pending} pending\n")
+              output.write(f"- Oldest pending update waiting: {waited}\n")
               output.write(f"- Latest pending error: `{latest_error}`\n")
 
           if outcome != "success" or pending != 0:
-              warning = f"Sheet sync outcome={outcome}; {pending} event(s) remain queued. Latest error: {latest_error}"
+              warning = (f"Sheet sync outcome={outcome}; {pending} event(s) remain queued; "
+                         f"the oldest has waited {waited}. Latest error: {latest_error}")
               warning = warning.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print(f"::warning title=Google Sheet synchronization::{warning}")
           PY

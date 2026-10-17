@@ -815,7 +815,18 @@ def record_fill(trade_id, phase, method, order, close_reason=None):
     return fill_id
 
 
-def sync_sheet_outbox(*, deadline=None, max_events=5):
+# Apps Script answers in about 10 s, so the read timeout leaves room for a
+# slow answer; a retried request only rewrites the same trade row.
+SHEET_REQUEST_TIMEOUT=(5,30)
+SHEET_REQUEST_ATTEMPTS=3
+# The longest one trade can take when every attempt times out.
+SHEET_TRADE_MAX_SECONDS=SHEET_REQUEST_ATTEMPTS*sum(SHEET_REQUEST_TIMEOUT)+sum(range(1,SHEET_REQUEST_ATTEMPTS))
+# Time --sync-sheet may spend; the workflow step's timeout-minutes must exceed it.
+SHEET_SYNC_SECONDS=300
+
+
+def sync_sheet_outbox(*, deadline=None):
+    """Send queued trade rows, oldest first, until none remain or the deadline is near."""
     if not GOOGLE_SCRIPT_URL or not GOOGLE_SCRIPT_SECRET:
         print("Google Sheet synchronization is not configured; queued events remain in SQLite.")
         return True
@@ -831,20 +842,17 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
     failures=[]
     processed=0
     for trade_id,trade_events in trades.items():
-        if processed>=max_events:
-            break
-        # A failed Apps Script call can consume about a minute across bounded
-        # retries. Keep that work outside the order-management safety reserve.
-        if deadline is not None and time_module.monotonic()+70>=deadline:
+        # Start a trade only if all of its retries can finish before the deadline.
+        if deadline is not None and time_module.monotonic()+SHEET_TRADE_MAX_SECONDS>=deadline:
             break
         processed+=1
         with db() as conn:
             payload=trade_sheet_payload(conn,trade_id)
         payload["auth_token"]=GOOGLE_SCRIPT_SECRET
         ok=False; last_error="unknown error"
-        for attempt in range(1,4):
+        for attempt in range(1,SHEET_REQUEST_ATTEMPTS+1):
             try:
-                response=requests.post(GOOGLE_SCRIPT_URL,json=payload,timeout=(5,15))
+                response=requests.post(GOOGLE_SCRIPT_URL,json=payload,timeout=SHEET_REQUEST_TIMEOUT)
                 response.raise_for_status()
                 body=response.json()
                 if not isinstance(body,dict) or body.get("ok") is not True or body.get("status") != 200:
@@ -863,7 +871,7 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
                 ok=True; break
             except (requests.RequestException,ValueError,OperationalFailure) as exc:
                 last_error=redact(exc)
-                if attempt<3: time_module.sleep(attempt)
+                if attempt<SHEET_REQUEST_ATTEMPTS: time_module.sleep(attempt)
         event_ids=[event["event_id"] for event in trade_events]
         marks=",".join("?"*len(event_ids))
         with db(write=True) as conn:
@@ -879,7 +887,7 @@ def sync_sheet_outbox(*, deadline=None, max_events=5):
                 failures.append(f"{trade_id}: {last_error}")
     deferred=max(0,len(trades)-processed)
     if deferred:
-        print(f"Deferred {deferred} trade(s) of Sheet updates to a later run to preserve the workflow deadline.")
+        print(f"Deferred {deferred} trade(s) of Sheet updates to a later run: this run's Sheet sync time budget ran out.")
     if failures:
         print(f"{len(failures)} trade(s) of Sheet updates remain queued: {failures[0]}", file=sys.stderr)
         return False
@@ -1211,13 +1219,33 @@ def record_close_quote_failure(trade_id, error):
     return status
 
 
+def append_step_summary(markdown):
+    """Add Markdown to the GitHub Actions step summary when one is available."""
+    path=os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path: return
+    try:
+        with open(path,"a",encoding="utf-8") as summary: summary.write(markdown)
+    except OSError as exc:
+        print(f"Could not write the step summary: {redact(exc)}",file=sys.stderr)
+
+
+def report_overdue_exits(overdue):
+    """Log and summarize the due positions this run left open, without failing the run."""
+    names=", ".join(f"{trade.get('Ticker') or '?'} {trade['trade_id']}" for trade in overdue)
+    print(f"Overdue exits after this run: {len(overdue)}"+(f" - {names}" if overdue else ""))
+    append_step_summary("### PAPER position exits\n\n"+f"- Overdue exits: {len(overdue)}"+(f" ({names})" if overdue else "")+"\n")
+
+
 def close_due_trades(client,reconciliation,run_deadline,market_close=None):
     """Close due positions and return the trades whose close quotes stayed invalid."""
     failures=[]
+    due=[]
     for trade in get_open_trades():
         opened=datetime.strptime(trade["Open Date"],"%Y-%m-%d").date(); when=trade.get("When") or "AMC"
         earnings=datetime.strptime(trade["earnings_date"],"%Y-%m-%d").date() if trade.get("earnings_date") else (opened+timedelta(days=1) if when=="BMO" else opened)
-        if not is_time_to_close(earnings,when): continue
+        if is_time_to_close(earnings,when): due.append(trade)
+    closed=set()
+    for trade in due:
         # Running out of time defers the remaining closes to the next run
         # instead of failing this one; the warning keeps them visible.
         if time_module.monotonic()+60>=run_deadline:
@@ -1257,8 +1285,12 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
             continue
         finalize_execution(tid,result)
         print(f"Close result trade={tid} method={method} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}")
-        if int(dec(getattr(result,"remaining_qty",0) or 0)) and getattr(result,"stop_reason","") in TIMING_STOP_REASONS:
-            print(f"::warning title=Due close deferred::trade={tid} remaining={getattr(result,'remaining_qty',qty)} stop_reason={result.stop_reason}; the next run retries it.")
+        # Whatever stopped the chase, an open due position waits for the next run.
+        if int(dec(getattr(result,"remaining_qty",0) or 0)):
+            print(f"::warning title=Due close deferred::trade={tid} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}; the next run retries it.")
+        else:
+            closed.add(tid)
+    report_overdue_exits([trade for trade in due if trade["trade_id"] not in closed])
     return failures
 
 
@@ -1483,7 +1515,7 @@ def run_sheet_sync_only():
     if not DB_PATH.exists():
         raise OperationalFailure(f"SQLite ledger does not exist at {DB_PATH}")
     init_db()
-    return 0 if sync_sheet_outbox() else 2
+    return 0 if sync_sheet_outbox(deadline=time_module.monotonic()+SHEET_SYNC_SECONDS) else 2
 
 
 def main(argv=None):
