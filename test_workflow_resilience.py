@@ -749,26 +749,29 @@ class ReplannedOpenTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             return trade_workflow.reconcile_broker_state(self.client(), read_only=False)
 
-    def assert_retry_skipped(self, quantity, contracts):
+    def test_a_smaller_retry_still_runs_and_keeps_the_larger_size_on_record(self):
         # Run 1: no fill at the price limit, so the plan is retryable.
         self.open_once(7, self.CONTRACTS)
         self.assertEqual(self.trade()["lifecycle_status"], "CANCELED_NO_FILL")
         sent = len(self.broker_orders)
-        self.assertGreater(sent, 0)
-        # Run 2 on the same day: the new plan no longer matches the orders sent.
-        self.open_once(quantity, contracts)
-        self.assertEqual(len(self.broker_orders), sent)
+        # Run 2 on the same day sizes the trade at 6 after the price moved.
+        self.open_once(6, self.CONTRACTS)
+        self.assertGreater(len(self.broker_orders), sent)
+        self.assertEqual({Decimal(order.qty) for order in self.broker_orders[sent:]}, {Decimal(6)})
         trade = self.trade()
-        self.assertEqual((trade["ordered_quantity"], trade["open_generation"]), (7, 1))
-        self.assertEqual((trade["Short Symbol"], trade["Long Symbol"]), self.CONTRACTS)
-        # The next run's startup check still matches every order.
+        self.assertEqual((trade["ordered_quantity"], trade["open_generation"]), (7, 2))
+        # The next run's startup check still matches the 7-lot and 6-lot orders.
         self.assertEqual(self.reconcile()["discrepancies"], [])
 
-    def test_a_retry_with_a_smaller_quantity_is_skipped(self):
-        self.assert_retry_skipped(6, self.CONTRACTS)
-
     def test_a_retry_on_another_strike_is_skipped(self):
-        self.assert_retry_skipped(7, self.OTHER_STRIKE)
+        self.open_once(7, self.CONTRACTS)
+        sent = len(self.broker_orders)
+        self.assertGreater(sent, 0)
+        self.open_once(7, self.OTHER_STRIKE)
+        self.assertEqual(len(self.broker_orders), sent)
+        trade = self.trade()
+        self.assertEqual((trade["Short Symbol"], trade["Long Symbol"], trade["open_generation"]), (*self.CONTRACTS, 1))
+        self.assertEqual(self.reconcile()["discrepancies"], [])
 
     def test_a_retry_that_keeps_the_contracts_and_size_still_runs(self):
         self.open_once(7, self.CONTRACTS)

@@ -496,18 +496,19 @@ def create_planned_trade(data, ordered_quantity):
             if active:
                 raise ReconciliationFailure(f"Trade {trade_id} has an unresolved active opening order")
             # Earlier orders stay in the broker's history and are checked against
-            # this plan, so a retry must keep their contracts and cover their size.
-            largest=conn.execute("SELECT MAX(ordered_quantity) FROM broker_orders WHERE trade_id=? AND phase='open'",(trade_id,)).fetchone()[0]
+            # this plan, so a retry keeps their contracts and the plan's size
+            # never drops below theirs; a smaller retry still submits its own size.
+            largest=int(conn.execute("SELECT COALESCE(MAX(ordered_quantity),0) FROM broker_orders WHERE trade_id=? AND phase='open'",(trade_id,)).fetchone()[0])
             contracts=lambda row:(str(row["Short Symbol"] or "").upper(),str(row["Long Symbol"] or "").upper())
-            if retryable and largest is not None and (int(largest)>ordered_quantity or contracts(existing)!=contracts(data)):
-                print(f"Skipping earnings event {trade_id}: its earlier orders do not match the new plan.")
+            if retryable and largest and contracts(existing)!=contracts(data):
+                print(f"Skipping earnings event {trade_id}: its earlier orders were for other contracts.")
                 return "skipped"
             if not retryable:
                 print(f"Skipping earnings event {trade_id}: durable state already exists.")
                 return "skipped"
             conn.execute('''UPDATE trades SET "Implied Move"=?,"Short Symbol"=?,"Long Symbol"=?,"Open Date"=?,earnings_date=?,
               ordered_quantity=?,lifecycle_status='PLANNED',reconciliation_status='ORDER_NOT_SUBMITTED',updated_at=? WHERE trade_id=?''',
-              (data.get("Implied Move"),data["Short Symbol"],data["Long Symbol"],data["Open Date"],data["earnings_date"],ordered_quantity,stamp(),trade_id))
+              (data.get("Implied Move"),data["Short Symbol"],data["Long Symbol"],data["Open Date"],data["earnings_date"],max(ordered_quantity,largest),stamp(),trade_id))
             return "reused"
         conn.execute('''INSERT INTO trades("Ticker","Implied Move","Structure","Side","When","Size","Short Symbol","Long Symbol",
           "Open Date","Open Comm.","Close Date","Close Comm.",trade_id,parent_trade_id,ordered_quantity,filled_quantity,
