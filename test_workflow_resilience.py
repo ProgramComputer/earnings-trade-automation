@@ -773,6 +773,45 @@ class ReplannedOpenTests(unittest.TestCase):
         self.assertEqual((trade["Short Symbol"], trade["Long Symbol"], trade["open_generation"]), (*self.CONTRACTS, 1))
         self.assertEqual(self.reconcile()["discrepancies"], [])
 
+    def test_a_retry_on_one_changed_leg_is_skipped(self):
+        for label, contracts in (
+            ("short leg", ("XYZ261030C00010000", self.CONTRACTS[1])),
+            ("long leg", (self.CONTRACTS[0], "XYZ261127C00010000")),
+        ):
+            with self.subTest(label):
+                self.broker_orders.clear()
+                with trade_workflow.db(write=True) as conn:
+                    conn.execute("DELETE FROM broker_orders")
+                    conn.execute("DELETE FROM trades")
+                self.open_once(7, self.CONTRACTS)
+                sent = len(self.broker_orders)
+                self.open_once(7, contracts)
+                self.assertEqual(len(self.broker_orders), sent)
+                trade = self.trade()
+                self.assertEqual((trade["Short Symbol"], trade["Long Symbol"]), self.CONTRACTS)
+                self.assertEqual(self.reconcile()["discrepancies"], [])
+
+    def test_the_plan_keeps_the_largest_size_sent_across_retries(self):
+        self.open_once(7, self.CONTRACTS)
+        self.open_once(8, self.CONTRACTS)
+        self.open_once(7, self.CONTRACTS)
+        self.assertEqual(self.trade()["ordered_quantity"], 8)
+        self.assertEqual(self.reconcile()["discrepancies"], [])
+
+    def test_a_plan_with_no_orders_sent_may_change_contracts(self):
+        # Quotes failed before any order, so nothing at the broker refers to this plan.
+        with redirect_stdout(io.StringIO()):
+            trade_workflow.create_planned_trade({
+                "trade_id": self.TRADE_ID, "Ticker": "XYZ", "When": "AMC", "Short Symbol": self.CONTRACTS[0],
+                "Long Symbol": self.CONTRACTS[1], "Open Date": "2026-10-19", "earnings_date": "2026-10-19",
+            }, 7)
+        self.assertTrue(trade_workflow.release_unfilled_open_plan(self.TRADE_ID, "open_quote_validation_failed"))
+        self.open_once(7, self.OTHER_STRIKE)
+        self.assertGreater(len(self.broker_orders), 0)
+        trade = self.trade()
+        self.assertEqual((trade["Short Symbol"], trade["Long Symbol"]), self.OTHER_STRIKE)
+        self.assertEqual(self.reconcile()["discrepancies"], [])
+
     def test_a_retry_that_keeps_the_contracts_and_size_still_runs(self):
         self.open_once(7, self.CONTRACTS)
         sent = len(self.broker_orders)
