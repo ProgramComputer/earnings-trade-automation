@@ -1,7 +1,14 @@
+import io
+import os
+import re
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
-from datetime import datetime, timezone
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,6 +450,191 @@ class SheetTradeRowTests(unittest.TestCase):
             conn.execute("UPDATE sheet_outbox SET state='synced'")
         trade_workflow.init_db()
         self.assertEqual(self.ledger("SELECT DISTINCT state FROM sheet_outbox"), [("synced",)])
+
+
+class SheetBacklogTests(unittest.TestCase):
+    """A backlog of closed trades drains in one sync instead of five trades per run."""
+
+    TICKERS = ("NKE", "STZ", "LEVI", "CFG", "RF", "AA", "IBKR")
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for name, value in (
+            ("DB_PATH", Path(directory.name) / "trades.db"),
+            ("GOOGLE_SCRIPT_URL", "https://script.google.com/macros/s/test-deployment/exec"),
+            ("GOOGLE_SCRIPT_SECRET", "test-only-secret"),
+        ):
+            patcher = patch.object(trade_workflow, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        sleep = patch.object(trade_workflow.time_module, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+        trade_workflow.init_db()
+        with trade_workflow.db(write=True) as conn:
+            conn.execute(
+                """INSERT INTO broker_identity VALUES(1,'PAPER','fingerprint',
+                'https://paper-api.alpaca.markets','2026-10-15','2026-10-15')"""
+            )
+            for number, ticker in enumerate(self.TICKERS):
+                trade_id, order_id, fill_id = f"trade-{ticker}", f"order-{ticker}", f"fill-{ticker}"
+                queued_at = f"2026-10-16T17:{number:02d}:00+00:00"
+                conn.execute(
+                    """INSERT INTO trades("Ticker","Size","Short Symbol","Long Symbol","Open Date",trade_id,
+                    parent_trade_id,ordered_quantity,lifecycle_status) VALUES(?,1,'SHORT','LONG','2026-10-15',?,?,1,'OPEN')""",
+                    (ticker, trade_id, trade_id),
+                )
+                conn.execute(
+                    """INSERT INTO broker_orders(order_id,trade_id,phase,method,ordered_quantity,filled_quantity,
+                    lifecycle_status,terminal,updated_at) VALUES(?,?,'open','calendar_spread',1,1,'filled',1,?)""",
+                    (order_id, trade_id, queued_at),
+                )
+                conn.execute(
+                    """INSERT INTO fills(fill_id,trade_id,parent_trade_id,broker_order_id,phase,method,
+                    cumulative_order_filled_quantity,filled_quantity,price,cash_flow_cents,commission_status,occurred_at)
+                    VALUES(?,?,?,?,'open','calendar_spread',1,1,'1.00',-10000,'confirmed',?)""",
+                    (fill_id, trade_id, trade_id, order_id, queued_at),
+                )
+                conn.execute(
+                    """INSERT INTO sheet_outbox(event_id,trade_id,fill_id,phase,payload_json,created_at,updated_at)
+                    VALUES(?,?,?,'open','{}',?,?)""",
+                    (fill_id, trade_id, fill_id, queued_at, queued_at),
+                )
+
+    def pending(self):
+        with trade_workflow.db() as conn:
+            return [row[0] for row in conn.execute(
+                "SELECT trade_id FROM sheet_outbox WHERE state!='synced' ORDER BY created_at"
+            )]
+
+    def test_the_whole_backlog_is_sent_in_one_run(self):
+        output = io.StringIO()
+        with (
+            patch.object(trade_workflow, "configured_mode"),
+            patch.object(trade_workflow.requests, "post", return_value=trade_row_response()) as post,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(trade_workflow.run_sheet_sync_only(), 0)
+        self.assertEqual(post.call_count, len(self.TICKERS))
+        self.assertEqual(self.pending(), [])
+        self.assertNotIn("Deferred", output.getvalue())
+
+    def test_the_time_budget_defers_the_rest_and_says_so(self):
+        # Each Apps Script request takes 60 s on this clock.
+        clock = {"now": 0}
+
+        def post(*_args, **_kwargs):
+            clock["now"] += 60
+            return trade_row_response()
+
+        output = io.StringIO()
+        with (
+            patch.object(trade_workflow.time_module, "monotonic", side_effect=lambda: clock["now"]),
+            patch.object(trade_workflow.requests, "post", side_effect=post),
+            redirect_stdout(output),
+        ):
+            self.assertTrue(trade_workflow.sync_sheet_outbox(deadline=trade_workflow.SHEET_TRADE_MAX_SECONDS + 150))
+        # Trades start at 0, 60 and 120 s; at 180 s one more could overrun the deadline.
+        self.assertEqual(self.pending(), ["trade-CFG", "trade-RF", "trade-AA", "trade-IBKR"])
+        self.assertIn(
+            "Deferred 4 trade(s) of Sheet updates to a later run: this run's Sheet sync time budget ran out.",
+            output.getvalue(),
+        )
+        self.assertNotIn("workflow deadline", output.getvalue())
+
+    def test_a_slow_apps_script_answer_is_waited_for(self):
+        with patch.object(trade_workflow.requests, "post", return_value=trade_row_response()) as post:
+            trade_workflow.sync_sheet_outbox()
+        connect, read = post.call_args.kwargs["timeout"]
+        # Requests take about 10 s, and 15 s was too close.
+        self.assertGreaterEqual(read, 30)
+
+
+WORKFLOW = Path(__file__).resolve().parent / ".github" / "workflows" / "config.yml"
+
+
+def workflow_steps():
+    """Map each workflow step's name to its block of YAML text."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    steps = {}
+    for block in text.split("\n      - name: ")[1:]:
+        name, newline, body = block.partition("\n")
+        steps[name.strip()] = newline + body
+    return steps
+
+
+def step_modes(body):
+    """The run modes a step's `if:` condition names."""
+    if "\n        if:" not in body:
+        return set()
+    condition = body.split("\n        if:", 1)[1].split("\n        shell:", 1)[0].split("\n        uses:", 1)[0]
+    return set(re.findall(r"run_mode == '([a-z-]+)'", condition))
+
+
+class WorkflowSheetStepTests(unittest.TestCase):
+    def test_market_closed_runs_only_set_up_sync_report_and_persist_the_ledger(self):
+        steps = workflow_steps()
+        closed = {name for name, body in steps.items() if "market-closed" in step_modes(body)}
+        self.assertEqual(closed, {
+            "Set up Python 3.10", "Install dependencies", "Sync optional Sheet outbox",
+            "Commit durable ledger updates", "Report optional Sheet synchronization",
+        })
+        self.assertNotIn("market-closed", step_modes(steps["Run PAPER trading workflow"]))
+        self.assertNotIn("market-closed", step_modes(steps["Wait for PAPER entry window"]))
+
+    def test_reconcile_only_runs_never_sync_the_sheet(self):
+        steps = workflow_steps()
+        self.assertEqual(step_modes(steps["Sync optional Sheet outbox"]), {"paper-trade", "market-closed"})
+        self.assertNotIn("reconcile-only", step_modes(steps["Report optional Sheet synchronization"]))
+
+    def test_the_sync_step_outlasts_the_sync_budget(self):
+        body = workflow_steps()["Sync optional Sheet outbox"]
+        minutes = int(re.search(r"\n        timeout-minutes: (\d+)", body).group(1))
+        self.assertGreater(minutes * 60, trade_workflow.SHEET_SYNC_SECONDS + 60)
+
+    def run_report(self, events, outcome="success"):
+        body = workflow_steps()["Report optional Sheet synchronization"]
+        script = textwrap.dedent(body.split("python - <<'PY'\n", 1)[1].split("\n          PY\n", 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            connection = sqlite3.connect(Path(directory) / "trades.db")
+            connection.execute(
+                "CREATE TABLE sheet_outbox (event_id TEXT, state TEXT, last_error TEXT, created_at TEXT, updated_at TEXT)"
+            )
+            connection.executemany("INSERT INTO sheet_outbox VALUES(?,?,?,?,?)", events)
+            connection.commit()
+            connection.close()
+            summary = Path(directory) / "summary.md"
+            completed = subprocess.run(
+                [sys.executable, "-c", script], cwd=directory, capture_output=True, text=True, check=True,
+                env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary), "SHEET_SYNC_OUTCOME": outcome},
+            )
+            return completed.stdout, summary.read_text(encoding="utf-8")
+
+    def test_the_warning_says_how_long_the_oldest_update_has_waited(self):
+        now = datetime.now(timezone.utc)
+        queued = lambda **age: (now - timedelta(**age) - timedelta(minutes=1)).isoformat()
+        stdout, summary = self.run_report([
+            ("synced-1", "synced", None, queued(days=12), queued(days=12)),
+            ("open-RF", "pending", "Read timed out", queued(days=4, hours=2), queued(minutes=5)),
+            ("close-RF", "pending", "Read timed out", queued(hours=20), queued(minutes=5)),
+        ])
+        self.assertIn("::warning title=Google Sheet synchronization::", stdout)
+        self.assertIn("2 event(s) remain queued; the oldest has waited 4d 2h.", stdout)
+        self.assertIn("- Oldest pending update waiting: 4d 2h", summary)
+
+    def test_a_backlog_under_a_day_is_shown_in_hours_and_minutes(self):
+        now = datetime.now(timezone.utc)
+        stdout, summary = self.run_report([
+            ("open-AA", "pending", None, (now - timedelta(hours=3, minutes=7, seconds=30)).isoformat(), now.isoformat()),
+        ])
+        self.assertIn("the oldest has waited 3h 7m.", stdout)
+
+    def test_an_empty_queue_reports_nothing_waiting_and_no_warning(self):
+        now = datetime.now(timezone.utc).isoformat()
+        stdout, summary = self.run_report([("synced-1", "synced", None, now, now)])
+        self.assertNotIn("::warning", stdout)
+        self.assertIn("- Oldest pending update waiting: nothing pending", summary)
 
 
 if __name__ == "__main__":
