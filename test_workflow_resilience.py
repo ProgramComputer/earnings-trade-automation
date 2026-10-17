@@ -1,4 +1,5 @@
 import io
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -653,6 +654,129 @@ class RunTimeBudgetTests(unittest.TestCase):
             stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=9_950))
             with self.assertRaises(trade_workflow.RunTimeBudgetReached):
                 open_one()
+
+
+class ReplannedOpenTests(unittest.TestCase):
+    """A same-day retry of an unfilled open must not break the check of its earlier orders."""
+
+    TRADE_ID = "11111111-2222-3333-4444-555555555555"
+    CONTRACTS = ("XYZ261023C00010000", "XYZ261120C00010000")
+    OTHER_STRIKE = ("XYZ261023C00011000", "XYZ261120C00011000")
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for patcher in (
+            patch.object(trade_workflow, "DB_PATH", Path(directory.name) / "trades.db"),
+            patch.dict(os.environ, {"ALPACA_PAPER": "true", "APCA_API_BASE_URL": "https://paper-api.alpaca.markets"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        trade_workflow.init_db()
+        fingerprint = trade_workflow.hashlib.sha256(b"alpaca-account-id:v1:account").hexdigest()
+        with trade_workflow.db(write=True) as conn:
+            conn.execute(
+                "INSERT INTO broker_identity VALUES(1,'PAPER',?,'https://paper-api.alpaca.markets','bound','bound')",
+                (fingerprint,),
+            )
+        self.broker_orders = []
+
+    def client(self):
+        now = datetime.now(timezone.utc)
+        client = paper_client()
+        client.get_account.return_value = SimpleNamespace(id="account", equity="100000", options_buying_power="100000")
+        client.get_all_positions.return_value = []
+        client.get_orders.side_effect = lambda filter=None: list(self.broker_orders)
+        client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+        return client
+
+    def open_once(self, quantity, contracts):
+        """One run's opening chase; every order is cancelled unfilled at the broker."""
+        short, long = contracts
+        client = self.client()
+
+        def submit(_client, request, client_order_id):
+            order_id = f"order-{len(self.broker_orders) + 1}"
+            legs = [
+                SimpleNamespace(symbol=short, ratio_qty="1", side="sell", position_intent="sell_to_open"),
+                SimpleNamespace(symbol=long, ratio_qty="1", side="buy", position_intent="buy_to_open"),
+            ]
+            self.broker_orders.append(SimpleNamespace(
+                id=order_id, client_order_id=client_order_id, status="canceled", qty=str(request.qty),
+                filled_qty="0", symbol="", order_class="mleg", time_in_force="day", type="limit",
+                asset_class="us_option", legs=legs,
+            ))
+            return SimpleNamespace(id=order_id, client_order_id=client_order_id, status="accepted", qty=request.qty)
+
+        def wait(_client, order_id, **kwargs):
+            result = canceled_attempt(order_id, kwargs["expected_qty"])
+            kwargs["terminal_state_callback"](result)
+            return result
+
+        chain = {"short": {10.0: {"call": SimpleNamespace(symbol=short)}}, "long": {10.0: {"call": SimpleNamespace(symbol=long)}}}
+        quotes = alpaca_integration.SpreadQuoteSnapshot(Decimal("0.50"), Decimal("0.60"), Decimal("0.80"), Decimal("1.00"))
+        with ExitStack() as stack:
+            for name, value in (
+                ("init_alpaca_client", Mock(return_value=client)),
+                ("_fetch_spread_quote_snapshot", Mock(return_value=quotes)),
+                ("_submit_order_idempotently", Mock(side_effect=submit)),
+                ("wait_for_fill", Mock(side_effect=wait)),
+            ):
+                stack.enter_context(patch.object(alpaca_integration, name, value))
+            for name, value in (
+                ("is_time_to_open", Mock(return_value=True)),
+                ("compute_recommendation", Mock(return_value={"avg_volume": True, "iv30_rv30": True, "ts_slope_0_45": True})),
+                ("select_expiries_and_strike_alpaca", Mock(return_value=("short", "long", 10.0))),
+                ("get_alpaca_option_chain", Mock(return_value=chain)),
+                ("get_spread_quotes", Mock(return_value=("0.50", "0.60", "0.80", "1.00"))),
+                ("candidate_allocation", Mock(return_value=(quantity, 1_000_000, 0, 10_000_000))),
+                ("stable_trade_id", Mock(return_value=self.TRADE_ID)),
+                ("exposure_cents", Mock(return_value=0)),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=0))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            trade_workflow.open_candidate(
+                client, {"act_symbol": "XYZ"}, "AMC", date(2026, 10, 19),
+                datetime(2026, 10, 19, 16, 0, tzinfo=EASTERN), 10_000,
+            )
+
+    def trade(self):
+        with trade_workflow.db() as conn:
+            return dict(conn.execute("SELECT * FROM trades WHERE trade_id=?", (self.TRADE_ID,)).fetchone())
+
+    def reconcile(self):
+        with redirect_stdout(io.StringIO()):
+            return trade_workflow.reconcile_broker_state(self.client(), read_only=False)
+
+    def assert_retry_skipped(self, quantity, contracts):
+        # Run 1: no fill at the price limit, so the plan is retryable.
+        self.open_once(7, self.CONTRACTS)
+        self.assertEqual(self.trade()["lifecycle_status"], "CANCELED_NO_FILL")
+        sent = len(self.broker_orders)
+        self.assertGreater(sent, 0)
+        # Run 2 on the same day: the new plan no longer matches the orders sent.
+        self.open_once(quantity, contracts)
+        self.assertEqual(len(self.broker_orders), sent)
+        trade = self.trade()
+        self.assertEqual((trade["ordered_quantity"], trade["open_generation"]), (7, 1))
+        self.assertEqual((trade["Short Symbol"], trade["Long Symbol"]), self.CONTRACTS)
+        # The next run's startup check still matches every order.
+        self.assertEqual(self.reconcile()["discrepancies"], [])
+
+    def test_a_retry_with_a_smaller_quantity_is_skipped(self):
+        self.assert_retry_skipped(6, self.CONTRACTS)
+
+    def test_a_retry_on_another_strike_is_skipped(self):
+        self.assert_retry_skipped(7, self.OTHER_STRIKE)
+
+    def test_a_retry_that_keeps_the_contracts_and_size_still_runs(self):
+        self.open_once(7, self.CONTRACTS)
+        sent = len(self.broker_orders)
+        self.open_once(8, self.CONTRACTS)
+        self.assertGreater(len(self.broker_orders), sent)
+        self.assertEqual(self.trade()["open_generation"], 2)
+        self.assertEqual(self.reconcile()["discrepancies"], [])
 
 
 if __name__ == "__main__":

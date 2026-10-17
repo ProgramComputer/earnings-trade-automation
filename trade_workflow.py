@@ -495,6 +495,13 @@ def create_planned_trade(data, ordered_quantity):
             retryable=int(existing["filled_quantity"] or 0)==0 and int(existing["remaining_quantity"] or 0)==0 and existing["lifecycle_status"] in {"PLANNED","CANCELED_NO_FILL"}
             if active:
                 raise ReconciliationFailure(f"Trade {trade_id} has an unresolved active opening order")
+            # Earlier orders stay in the broker's history and are checked against
+            # this plan, so a retry must keep their contracts and cover their size.
+            largest=conn.execute("SELECT MAX(ordered_quantity) FROM broker_orders WHERE trade_id=? AND phase='open'",(trade_id,)).fetchone()[0]
+            contracts=lambda row:(str(row["Short Symbol"] or "").upper(),str(row["Long Symbol"] or "").upper())
+            if retryable and largest is not None and (int(largest)>ordered_quantity or contracts(existing)!=contracts(data)):
+                print(f"Skipping earnings event {trade_id}: its earlier orders do not match the new plan.")
+                return "skipped"
             if not retryable:
                 print(f"Skipping earnings event {trade_id}: durable state already exists.")
                 return "skipped"
