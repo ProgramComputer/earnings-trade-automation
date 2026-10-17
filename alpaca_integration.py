@@ -1302,9 +1302,10 @@ def get_alpaca_option_chain(symbol):
         return None
 
 
-def select_expiries_and_strike_alpaca(symbol, earnings_date):
+def select_expiries_and_strike_alpaca(symbol, short_after):
     """
     Use Alpaca's option chain to select front and back month expiries and ATM strike for the calendar spread.
+    The front (short) expiry is the first strictly after ``short_after``.
     Returns (expiry_short, expiry_long, strike) or (None, None, None) if not found.
     """
     option_chain = get_alpaca_option_chain(symbol)
@@ -1312,9 +1313,9 @@ def select_expiries_and_strike_alpaca(symbol, earnings_date):
         return None, None, None
     try:
         exp_dates = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in option_chain.keys()])
-        # Find front month expiry (first after earnings)
-        expiry_short = next((d for d in exp_dates if d > earnings_date), None)
+        expiry_short = next((d for d in exp_dates if d > short_after), None)
         if not expiry_short:
+            print(f"No {symbol} option expiry after {short_after}")
             return None, None, None
         # Find back month expiry (closest to 30 days after front)
         target_back = expiry_short + timedelta(days=30)
