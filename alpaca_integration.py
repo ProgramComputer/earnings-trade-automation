@@ -29,6 +29,9 @@ DEFAULT_CANCEL_TIMEOUT = 20
 DEFAULT_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("QUOTE_MAX_AGE_SECONDS") or "120")
 DEFAULT_QUOTE_FETCH_ATTEMPTS = 3
 DEFAULT_QUOTE_RETRY_DELAY_SECONDS = 2
+# Opening prices step a tenth of the net market's width: five steps from the
+# midpoint to the ask. Closing orders keep quarter-width steps.
+OPENING_CHASE_DIVISIONS = 10
 _OPTION_CHAIN_CACHE = {}
 
 
@@ -511,9 +514,9 @@ def _client_order_id(prefix, operation, attempt_number):
     return f"{safe[:max(1, 48 - len(suffix))]}{suffix}"
 
 
-def _chase_step(lower, upper):
+def _chase_step(lower, upper, divisions=4):
     width = max(upper - lower, Decimal("0"))
-    return max((width / Decimal("4")).quantize(CENT, rounding=ROUND_CEILING), CENT)
+    return max((width / Decimal(divisions)).quantize(CENT, rounding=ROUND_CEILING), CENT)
 
 
 def _durable_attempt_callback(on_terminal, on_filled):
@@ -756,6 +759,8 @@ def place_calendar_spread_order(
     target_debit_price=None,
     *,
     client_order_id_prefix,
+    max_debit_price=None,
+    debit_ceiling_for=None,
     max_attempts=DEFAULT_MAX_ATTEMPTS,
     overall_timeout=DEFAULT_OVERALL_TIMEOUT,
     attempt_timeout=DEFAULT_ATTEMPT_TIMEOUT,
@@ -770,11 +775,14 @@ def place_calendar_spread_order(
 
     ``target_debit_price`` (or, for compatibility, ``limit_price``) is a hard
     net-spread debit ceiling. It is never replaced by either leg's standalone
-    ask. ``on_terminal`` receives every newly observed cumulative fill and every
-    safely inactive order snapshot, including zero-fill cancellations and
-    expirations. ``on_order_state`` is the separate terminal-state-only path used
-    even if a terminal fill has no publishable price. The legacy ``on_filled``
-    parameter is used for fill accounting when ``on_terminal`` is omitted.
+    ask. ``debit_ceiling_for(net_bid, net_ask)`` lets a rising market lift the
+    ceiling for an attempt, never above ``max_debit_price``; no attempt pays
+    more than its fresh net ask. ``on_terminal`` receives every newly observed
+    cumulative fill and every safely inactive order snapshot, including
+    zero-fill cancellations and expirations. ``on_order_state`` is the separate
+    terminal-state-only path used even if a terminal fill has no publishable
+    price. The legacy ``on_filled`` parameter is used for fill accounting when
+    ``on_terminal`` is omitted.
     """
     requested_qty = _int_quantity(original_intended_quantity, "requested quantity")
     if requested_qty < 1:
@@ -787,6 +795,9 @@ def place_calendar_spread_order(
     hard_ceiling = _max_price_cent(ceiling_input)
     if hard_ceiling <= 0:
         raise ValueError("target_debit_price must be a positive net debit")
+    max_ceiling = hard_ceiling if max_debit_price is None else _max_price_cent(max_debit_price)
+    if max_ceiling < hard_ceiling:
+        raise ValueError("max_debit_price cannot be below the target_debit_price ceiling")
     starting_limit = _nearest_cent(limit_price if limit_price is not None else ceiling_input)
     maximum_budget = (
         None
@@ -827,12 +838,17 @@ def place_calendar_spread_order(
                 f"bid={net_bid}, ask={net_ask}."
             )
         midpoint = (net_bid + net_ask) / Decimal("2")
+        attempt_ceiling = hard_ceiling
+        if debit_ceiling_for is not None:
+            attempt_ceiling = max(
+                hard_ceiling, min(_max_price_cent(debit_ceiling_for(net_bid, net_ask)), max_ceiling)
+            )
         proposed = (
             starting_limit
             if previous_limit is None
-            else previous_limit + _chase_step(net_bid, net_ask)
+            else previous_limit + _chase_step(net_bid, net_ask, OPENING_CHASE_DIVISIONS)
         )
-        upper_bound = min(net_ask, hard_ceiling)
+        upper_bound = min(net_ask, attempt_ceiling)
         if upper_bound <= 0:
             stop_reason = "no_positive_debit_within_hard_limit"
             break
@@ -840,7 +856,7 @@ def place_calendar_spread_order(
         attempt_limit = _max_price_cent(
             max(lower_reference, min(proposed, midpoint if previous_limit is None else proposed, upper_bound))
         )
-        if attempt_limit > hard_ceiling:
+        if attempt_limit > attempt_ceiling or attempt_ceiling > max_ceiling:
             raise OrderExecutionError("Opening price calculation exceeded its hard debit ceiling")
         if attempt_limit in attempted_prices:
             stop_reason = "hard_price_limit_reached"
@@ -912,7 +928,8 @@ def place_calendar_spread_order(
             f"Submitted {_client_mode_label(client)} spread open attempt "
             f"{attempt_number}/{max_attempts}: "
             f"order_id={submitted.id}, qty={qty_for_attempt}, net_limit={attempt_limit}, "
-            f"net_bid={net_bid}, net_ask={net_ask}, hard_ceiling={hard_ceiling}."
+            f"net_bid={net_bid}, net_ask={net_ask}, hard_ceiling={attempt_ceiling}, "
+            f"max_ceiling={max_ceiling}."
         )
         _notify_submitted_order(
             on_submitted,
@@ -957,10 +974,10 @@ def place_calendar_spread_order(
                 raise OrderExecutionError(
                     f"Order {result.order_id} filled without an average fill price"
                 )
-            if result.average_fill_price > hard_ceiling:
+            if result.average_fill_price > attempt_ceiling:
                 raise OrderExecutionError(
                     f"Order {result.order_id} filled above hard debit ceiling: "
-                    f"{result.average_fill_price} > {hard_ceiling}"
+                    f"{result.average_fill_price} > {attempt_ceiling}"
                 )
             if result.average_fill_price > attempt_limit:
                 raise OrderExecutionError(

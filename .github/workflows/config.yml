@@ -42,6 +42,7 @@ jobs:
       # Unset repository variables arrive empty, and the code applies its defaults.
       QUOTE_MAX_AGE_SECONDS: ${{ vars.QUOTE_MAX_AGE_SECONDS }}
       OPEN_MAX_DEBIT_SPREAD_FRACTION: ${{ vars.OPEN_MAX_DEBIT_SPREAD_FRACTION }}
+      OPEN_CEILING_FOLLOW_PCT: ${{ vars.OPEN_CEILING_FOLLOW_PCT }}
       POSITION_ALLOCATION_PCT: ${{ vars.POSITION_ALLOCATION_PCT }}
       KELLY_FRACTION: ${{ vars.KELLY_FRACTION }}
       KELLY_WIN_RATE: ${{ vars.KELLY_WIN_RATE }}
