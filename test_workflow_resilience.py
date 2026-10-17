@@ -656,6 +656,72 @@ class RunTimeBudgetTests(unittest.TestCase):
                 open_one()
 
 
+class OverdueExitTests(unittest.TestCase):
+    """A due position the run leaves open is a warning and a summary count, never a failure."""
+
+    def due(self, ticker):
+        return {
+            "trade_id": f"trade-{ticker}", "Ticker": ticker, "Open Date": "2026-10-15", "When": "AMC",
+            "earnings_date": "2026-10-15", "remaining_quantity": 3, "Short Symbol": "SHORT", "Long Symbol": "LONG",
+        }
+
+    def close_due(self, trades, results, monotonic=0):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        summary = Path(directory.name) / "summary.md"
+        output = io.StringIO()
+        with (
+            patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}),
+            patch.object(trade_workflow, "get_open_trades", return_value=trades),
+            patch.object(trade_workflow, "is_time_to_close", return_value=True),
+            patch.object(trade_workflow.time_module, "monotonic", return_value=monotonic),
+            patch.object(trade_workflow, "account_snapshot"),
+            patch.object(trade_workflow, "reserve_operation_prefix", return_value="prefix"),
+            patch.object(trade_workflow, "finalize_execution"),
+            patch.object(trade_workflow, "close_calendar_spread_order", side_effect=results) as close_order,
+            redirect_stdout(output),
+        ):
+            failures = trade_workflow.close_due_trades(
+                object(), {"resolutions": {trade["trade_id"]: "MATCHED_SPREAD" for trade in trades}}, 10_000,
+            )
+        self.assertEqual(failures, [])
+        return close_order, output.getvalue(), summary.read_text(encoding="utf-8") if summary.exists() else ""
+
+    def unfilled(self, reason):
+        return SimpleNamespace(filled_qty=0, remaining_qty=3, stop_reason=reason, attempts=())
+
+    def test_a_due_close_stopped_by_its_price_limit_is_warned_about(self):
+        # RF on 2026-10-16: the 4th close attempt ended unfilled at its limit.
+        for reason in ("hard_price_limit_reached", "max_attempts_reached", "overall_deadline_reached"):
+            with self.subTest(reason=reason):
+                _, output, summary = self.close_due([self.due("RF")], [self.unfilled(reason)])
+                self.assertIn(
+                    f"::warning title=Due close deferred::trade=trade-RF remaining=3 stop_reason={reason}", output
+                )
+                self.assertIn("- Overdue exits: 1 (RF trade-RF)", summary)
+
+    def test_the_summary_counts_every_due_position_left_open(self):
+        filled = SimpleNamespace(filled_qty=3, remaining_qty=0, stop_reason="requested_quantity_filled", attempts=())
+        _, output, summary = self.close_due(
+            [self.due("CFG"), self.due("RF"), self.due("AA")],
+            [filled, self.unfilled("hard_price_limit_reached"), filled],
+        )
+        self.assertEqual(output.count("::warning title=Due close deferred::"), 1)
+        self.assertIn("### PAPER position exits", summary)
+        self.assertIn("- Overdue exits: 1 (RF trade-RF)", summary)
+
+    def test_closes_the_run_had_no_time_for_are_counted_as_overdue(self):
+        close_order, _, summary = self.close_due([self.due("AA"), self.due("IBKR")], [], monotonic=9_950)
+        close_order.assert_not_called()
+        self.assertIn("- Overdue exits: 2 (AA trade-AA, IBKR trade-IBKR)", summary)
+
+    def test_a_run_that_closes_every_due_position_reports_none_overdue(self):
+        filled = SimpleNamespace(filled_qty=3, remaining_qty=0, stop_reason="requested_quantity_filled", attempts=())
+        _, output, summary = self.close_due([self.due("CFG")], [filled])
+        self.assertNotIn("::warning", output)
+        self.assertIn("- Overdue exits: 0\n", summary)
+
+
 class ReplannedOpenTests(unittest.TestCase):
     """A same-day retry of an unfilled open must not break the check of its earlier orders."""
 

@@ -1211,13 +1211,33 @@ def record_close_quote_failure(trade_id, error):
     return status
 
 
+def append_step_summary(markdown):
+    """Add Markdown to the GitHub Actions step summary when one is available."""
+    path=os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path: return
+    try:
+        with open(path,"a",encoding="utf-8") as summary: summary.write(markdown)
+    except OSError as exc:
+        print(f"Could not write the step summary: {redact(exc)}",file=sys.stderr)
+
+
+def report_overdue_exits(overdue):
+    """Log and summarize the due positions this run left open, without failing the run."""
+    names=", ".join(f"{trade.get('Ticker') or '?'} {trade['trade_id']}" for trade in overdue)
+    print(f"Overdue exits after this run: {len(overdue)}"+(f" - {names}" if overdue else ""))
+    append_step_summary("### PAPER position exits\n\n"+f"- Overdue exits: {len(overdue)}"+(f" ({names})" if overdue else "")+"\n")
+
+
 def close_due_trades(client,reconciliation,run_deadline,market_close=None):
     """Close due positions and return the trades whose close quotes stayed invalid."""
     failures=[]
+    due=[]
     for trade in get_open_trades():
         opened=datetime.strptime(trade["Open Date"],"%Y-%m-%d").date(); when=trade.get("When") or "AMC"
         earnings=datetime.strptime(trade["earnings_date"],"%Y-%m-%d").date() if trade.get("earnings_date") else (opened+timedelta(days=1) if when=="BMO" else opened)
-        if not is_time_to_close(earnings,when): continue
+        if is_time_to_close(earnings,when): due.append(trade)
+    closed=set()
+    for trade in due:
         # Running out of time defers the remaining closes to the next run
         # instead of failing this one; the warning keeps them visible.
         if time_module.monotonic()+60>=run_deadline:
@@ -1257,8 +1277,12 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
             continue
         finalize_execution(tid,result)
         print(f"Close result trade={tid} method={method} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}")
-        if int(dec(getattr(result,"remaining_qty",0) or 0)) and getattr(result,"stop_reason","") in TIMING_STOP_REASONS:
-            print(f"::warning title=Due close deferred::trade={tid} remaining={getattr(result,'remaining_qty',qty)} stop_reason={result.stop_reason}; the next run retries it.")
+        # Whatever stopped the chase, an open due position waits for the next run.
+        if int(dec(getattr(result,"remaining_qty",0) or 0)):
+            print(f"::warning title=Due close deferred::trade={tid} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}; the next run retries it.")
+        else:
+            closed.add(tid)
+    report_overdue_exits([trade for trade in due if trade["trade_id"] not in closed])
     return failures
 
 
