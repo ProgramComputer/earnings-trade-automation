@@ -22,7 +22,7 @@ from alpaca.trading.enums import PositionIntent
 
 from automation import compute_recommendation, get_todays_earnings, get_tomorrows_earnings
 from alpaca_integration import (
-    DEFAULT_QUOTE_MAX_AGE_SECONDS, QuoteValidationError,
+    DEFAULT_QUOTE_MAX_AGE_SECONDS, QuoteValidationError, SubmissionTimingRefusal,
     close_calendar_spread_order, close_single_option_leg_order,
     get_alpaca_option_chain, get_spread_quotes, init_alpaca_client,
     place_calendar_spread_order, select_expiries_and_strike_alpaca,
@@ -79,6 +79,18 @@ class OperationalFailure(RuntimeError):
 
 class ReconciliationFailure(OperationalFailure):
     pass
+
+
+class SubmissionWindowClosed(OperationalFailure, SubmissionTimingRefusal):
+    """Only timing stops the next order, so the chase ends and the run goes on."""
+
+
+class RunTimeBudgetReached(OperationalFailure):
+    """Too little run time is left to start another candidate."""
+
+
+# Orders that ended only because their time ran out or the market was closing.
+TIMING_STOP_REASONS = {"order_time_budget_reached", "market_closed", "close_cutoff_reached"}
 
 
 def dec(value, default="0"):
@@ -897,17 +909,22 @@ def exposure_cents():
 
 def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_debit=True, deadline=None):
     def guard(client,context):
+        # Timing refusals end the chase like a price limit; the adapter stops
+        # with no live order. Every other refusal still fails the run.
         if deadline is not None and time_module.monotonic()+60 >= deadline:
-            raise OperationalFailure("Insufficient run time remains to submit and cancel-confirm an order safely")
+            raise SubmissionWindowClosed("Insufficient run time remains to submit and cancel-confirm an order safely","order_time_budget_reached")
         reconcile_broker_state(client,read_only=True)
         try: clock=client.get_clock()
         except Exception as exc: raise OperationalFailure(f"Unable to refresh broker market clock: {redact(exc)}") from exc
-        if not bool(getattr(clock,"is_open",False)):
-            raise OperationalFailure("Market closed before order submission")
+        is_open=getattr(clock,"is_open",None)
+        if is_open is False:
+            raise SubmissionWindowClosed("Market closed before order submission","market_closed")
+        if is_open is not True:
+            raise OperationalFailure("Broker clock did not report whether the market is open")
         next_close=getattr(clock,"next_close",None)
         now=getattr(clock,"timestamp",None) or datetime.now(timezone.utc)
         if isinstance(next_close,datetime) and isinstance(now,datetime) and now>=next_close-timedelta(minutes=3):
-            raise OperationalFailure("Order submission cutoff reached before market close")
+            raise SubmissionWindowClosed("Order submission cutoff reached before market close","close_cutoff_reached")
         equity,buying=account_snapshot(client)
         price=dec(context.get("limit_price",0)); quantity=int(context.get("quantity",0))
         required=(abs(price) if opening else (max(price,Decimal(0)) if close_requires_debit else Decimal(0)))*quantity*100
@@ -924,9 +941,9 @@ def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_deb
         # calls. Re-check both boundaries immediately before the adapter is
         # allowed to submit a physical order.
         if isinstance(next_close,datetime) and datetime.now(timezone.utc)>=next_close-timedelta(minutes=3):
-            raise OperationalFailure("Order submission cutoff reached before market close")
+            raise SubmissionWindowClosed("Order submission cutoff reached before market close","close_cutoff_reached")
         if deadline is not None and time_module.monotonic()+60>=deadline:
-            raise OperationalFailure("Insufficient run time remains to submit and cancel-confirm an order safely")
+            raise SubmissionWindowClosed("Insufficient run time remains to submit and cancel-confirm an order safely","order_time_budget_reached")
     return guard
 
 
@@ -1186,15 +1203,21 @@ def record_close_quote_failure(trade_id, error):
     return status
 
 
-def close_due_trades(client,reconciliation,run_deadline):
+def close_due_trades(client,reconciliation,run_deadline,market_close=None):
     """Close due positions and return the trades whose close quotes stayed invalid."""
     failures=[]
     for trade in get_open_trades():
-        if time_module.monotonic()+60>=run_deadline:
-            raise OperationalFailure("Run deadline reached before all due positions were processed")
         opened=datetime.strptime(trade["Open Date"],"%Y-%m-%d").date(); when=trade.get("When") or "AMC"
         earnings=datetime.strptime(trade["earnings_date"],"%Y-%m-%d").date() if trade.get("earnings_date") else (opened+timedelta(days=1) if when=="BMO" else opened)
         if not is_time_to_close(earnings,when): continue
+        # Running out of time defers the remaining closes to the next run
+        # instead of failing this one; the warning keeps them visible.
+        if time_module.monotonic()+60>=run_deadline:
+            print("::warning title=Due close deferred::Run time ran out before every due position was closed; the next run retries them.")
+            break
+        if isinstance(market_close,datetime) and datetime.now(EASTERN)>=market_close.astimezone(EASTERN)-timedelta(minutes=3):
+            print("::warning title=Due close deferred::The pre-close cutoff was reached before every due position was closed; the next run retries them.")
+            break
         tid=trade["trade_id"]; qty=int(trade["remaining_quantity"] or 0); state=reconciliation["resolutions"].get(tid)
         account_snapshot(client)
         operation_deadline=min(time_module.monotonic()+240,run_deadline)
@@ -1226,6 +1249,8 @@ def close_due_trades(client,reconciliation,run_deadline):
             continue
         finalize_execution(tid,result)
         print(f"Close result trade={tid} method={method} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}")
+        if int(dec(getattr(result,"remaining_qty",0) or 0)) and getattr(result,"stop_reason","") in TIMING_STOP_REASONS:
+            print(f"::warning title=Due close deferred::trade={tid} remaining={getattr(result,'remaining_qty',qty)} stop_reason={result.stop_reason}; the next run retries it.")
     return failures
 
 
@@ -1275,7 +1300,7 @@ def candidate_allocation(client,spread_cost):
 
 def open_candidate(client,item,when,earnings_date,market_close,run_deadline):
     if time_module.monotonic()+60>=run_deadline:
-        raise OperationalFailure("Run deadline reached before candidate processing")
+        raise RunTimeBudgetReached("Run time budget reached before candidate processing")
     ticker=str(item["act_symbol"]).upper()
     if not is_time_to_open(earnings_date,when,market_close):
         print(f"Skipping {ticker}: outside the broker-confirmed opening window."); return
@@ -1365,7 +1390,7 @@ def run_trade_workflow():
         print(f"Market closed; neutral skip. Next open: {getattr(clock,'next_open','unknown')}"); return 0
     # A close stuck on invalid quotes is reported after entries rather than
     # blocking them; the stuck position still counts toward the exposure cap.
-    close_failures=close_due_trades(client,reconciliation,run_deadline)
+    close_failures=close_due_trades(client,reconciliation,run_deadline,getattr(clock,"next_close",None))
     open_new_positions(client,clock,run_deadline)
     if close_failures:
         raise OperationalFailure(
@@ -1389,17 +1414,22 @@ def open_new_positions(client,clock,run_deadline):
     next_open=getattr(clock,"next_open",None)
     if not isinstance(next_open,datetime): raise OperationalFailure("Broker clock did not provide the next session open")
     next_session_date=next_open.astimezone(EASTERN).date()
+    if time_module.monotonic()+60>=run_deadline:
+        print("Run time budget reached; new openings skipped."); return
     try: todays=get_todays_earnings(); tomorrows=get_tomorrows_earnings(next_open=next_open)
     except RuntimeError as exc:
         raise OperationalFailure(f"Earnings calendar unavailable; new openings skipped this run: {redact(exc)}") from exc
     if not isinstance(todays,list) or not isinstance(tomorrows,list): raise OperationalFailure("Earnings source returned invalid data")
     print(f"Earnings source returned {len(todays)} current-session and {len(tomorrows)} next-session records.")
-    for item in tomorrows:
-        if "before" in str(item.get("when") or "").lower(): open_candidate(client,item,"BMO",next_session_date,market_close,run_deadline)
-        elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: next-session record is not BMO.")
-    for item in todays:
-        if "after" in str(item.get("when") or "").lower(): open_candidate(client,item,"AMC",now.date(),market_close,run_deadline)
-        elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: current-session record is not AMC.")
+    try:
+        for item in tomorrows:
+            if "before" in str(item.get("when") or "").lower(): open_candidate(client,item,"BMO",next_session_date,market_close,run_deadline)
+            elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: next-session record is not BMO.")
+        for item in todays:
+            if "after" in str(item.get("when") or "").lower(): open_candidate(client,item,"AMC",now.date(),market_close,run_deadline)
+            elif item.get("act_symbol"): print(f"Skipping {item['act_symbol']}: current-session record is not AMC.")
+    except RunTimeBudgetReached as exc:
+        print(f"{exc}; remaining candidates skipped.")
 
 
 def run_reconcile_only():

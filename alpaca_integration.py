@@ -52,6 +52,18 @@ class OrderExecutionError(RuntimeError):
     """Raised when the broker rejects an order or reports an impossible execution."""
 
 
+class SubmissionTimingRefusal(RuntimeError):
+    """Raised by a before_submit guard when only timing forbids the next order.
+
+    Running out of the order's time budget, the market closing, or the pre-close
+    cutoff ends a chase like any other stop instead of failing it.
+    """
+
+    def __init__(self, message, stop_reason="submission_window_closed"):
+        super().__init__(message)
+        self.stop_reason = str(stop_reason or "submission_window_closed")
+
+
 @dataclass(frozen=True)
 class OrderLifecycleResult:
     """Final, broker-confirmed state for one submitted order.
@@ -583,10 +595,22 @@ def _notify_submitted_order(
 
 
 def _run_before_submit(callback, client, context):
-    if callback is not None:
-        # A buying-power/reconciliation guard belongs here, immediately before
-        # each physical submission rather than once before the entire chase.
+    """Run the guard; return a stop reason when only timing forbids submitting."""
+    if callback is None:
+        return None
+    # A buying-power/reconciliation guard belongs here, immediately before
+    # each physical submission rather than once before the entire chase.
+    # Every earlier attempt is already terminal here, so a timing refusal ends
+    # the chase without a live order. Any other refusal still propagates.
+    try:
         callback(client, context)
+    except SubmissionTimingRefusal as exc:
+        print(
+            f"{_client_mode_label(client)} {context.get('operation', 'order')} attempt "
+            f"{context.get('attempt_number')} not submitted: {exc}"
+        )
+        return exc.stop_reason
+    return None
 
 
 def _enum_value(value):
@@ -862,7 +886,7 @@ def place_calendar_spread_order(
             limit_price=float(attempt_limit),
             **request_kwargs,
         )
-        _run_before_submit(
+        declined = _run_before_submit(
             before_submit,
             client,
             {
@@ -875,6 +899,9 @@ def place_calendar_spread_order(
                 "long_symbol": long_symbol,
             },
         )
+        if declined:
+            stop_reason = declined
+            break
         if time.monotonic() >= deadline:
             stop_reason = "overall_deadline_reached_before_submission"
             break
@@ -1094,7 +1121,7 @@ def close_calendar_spread_order(
             limit_price=float(attempt_limit),
             **request_kwargs,
         )
-        _run_before_submit(
+        declined = _run_before_submit(
             before_submit,
             client,
             {
@@ -1107,6 +1134,9 @@ def close_calendar_spread_order(
                 "long_symbol": long_symbol,
             },
         )
+        if declined:
+            stop_reason = declined
+            break
         if time.monotonic() >= deadline:
             stop_reason = "overall_deadline_reached_before_submission"
             break
@@ -1822,7 +1852,7 @@ def close_single_option_leg_order(
             position_intent=position_intent,
             **request_kwargs,
         )
-        _run_before_submit(
+        declined = _run_before_submit(
             before_submit,
             client,
             {
@@ -1833,6 +1863,9 @@ def close_single_option_leg_order(
                 "symbol": symbol,
             },
         )
+        if declined:
+            stop_reason = declined
+            break
         if time.monotonic() >= deadline:
             stop_reason = "overall_deadline_reached_before_submission"
             break

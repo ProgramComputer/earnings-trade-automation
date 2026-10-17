@@ -1,7 +1,8 @@
+import io
 import sqlite3
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas as pd
+from alpaca.trading.enums import PositionIntent
 
 import alpaca_integration
 import automation
@@ -356,6 +358,278 @@ class QuoteAgeTests(unittest.TestCase):
             ),
             (Decimal("0.03"), Decimal("0.05")),
         )
+
+
+# A quiet market: opening net 0.65 x 0.80, closing signed -0.80 x -0.65.
+CHASE_QUOTES = alpaca_integration.SpreadQuoteSnapshot(
+    Decimal("0.10"), Decimal("0.15"), Decimal("0.80"), Decimal("0.90")
+)
+
+
+def canceled_attempt(order_id, quantity):
+    return alpaca_integration.OrderLifecycleResult(
+        order_id=order_id, symbol="SHORT", ordered_qty=quantity, filled_qty=0,
+        canceled_qty=quantity, remaining_qty=quantity, status="canceled", terminal=True,
+        timed_out=True, cancel_confirmed=True, average_fill_price=None,
+        commission_amount=None, stop_reason="deadline_cancel_confirmed", raw_order=None,
+    )
+
+
+def chase_patches(stack, client, quotes=CHASE_QUOTES):
+    """Patch the broker edges of every adapter; each order times out unfilled."""
+    submitted = []
+
+    def submit(_client, _request, client_order_id):
+        submitted.append(client_order_id)
+        return SimpleNamespace(id=f"order-{len(submitted)}")
+
+    for name, value in (
+        ("init_alpaca_client", Mock(return_value=client)),
+        ("_fetch_spread_quote_snapshot", Mock(return_value=quotes)),
+        ("_fetch_single_quote_snapshot", Mock(return_value=alpaca_integration.SingleQuoteSnapshot(Decimal("0.40"), Decimal("0.50")))),
+        ("_submit_order_idempotently", Mock(side_effect=submit)),
+        ("_notify_submitted_order", Mock()),
+        ("_notify_terminal_attempt", Mock()),
+        ("wait_for_fill", Mock(side_effect=lambda _client, order_id, **kwargs: canceled_attempt(order_id, kwargs["expected_qty"]))),
+    ):
+        stack.enter_context(patch.object(alpaca_integration, name, value))
+    return submitted
+
+
+def paper_client():
+    client = Mock()
+    client._eta_paper_mode = True
+    return client
+
+
+def refuse_on_attempt(number, error):
+    def guard(_client, context):
+        if context["attempt_number"] == number:
+            raise error
+    return guard
+
+
+ADAPTERS = {
+    "open spread": lambda guard: alpaca_integration.place_calendar_spread_order(
+        "SHORT", "LONG", 3, limit_price=Decimal("0.70"), target_debit_price=Decimal("0.80"),
+        before_submit=guard, client_order_id_prefix="test",
+    ),
+    "close spread": lambda guard: alpaca_integration.close_calendar_spread_order(
+        "SHORT", "LONG", 3, max_close_debit=Decimal("0.50"), before_submit=guard,
+        client_order_id_prefix="test",
+    ),
+    "close single leg": lambda guard: alpaca_integration.close_single_option_leg_order(
+        "LONG", 3, PositionIntent.SELL_TO_CLOSE, before_submit=guard, client_order_id_prefix="test",
+    ),
+}
+
+
+class TimingRefusalTests(unittest.TestCase):
+    """Running out of order time or meeting the close ends a chase, not the run."""
+
+    def test_each_adapter_stops_cleanly_when_only_timing_refuses_the_next_order(self):
+        refusal = trade_workflow.SubmissionWindowClosed("no time left", "order_time_budget_reached")
+        for name, run in ADAPTERS.items():
+            with self.subTest(adapter=name), ExitStack() as stack:
+                submitted = chase_patches(stack, paper_client())
+                result = run(refuse_on_attempt(2, refusal))
+            self.assertEqual(result.stop_reason, "order_time_budget_reached")
+            self.assertEqual(len(submitted), 1)
+            self.assertEqual(len(result.attempts), 1)
+            self.assertEqual((result.filled_qty, result.remaining_qty), (0, 3))
+
+    def test_a_refusal_before_the_first_order_submits_nothing(self):
+        refusal = trade_workflow.SubmissionWindowClosed("closed", "market_closed")
+        with ExitStack() as stack:
+            submitted = chase_patches(stack, paper_client())
+            result = ADAPTERS["open spread"](refuse_on_attempt(1, refusal))
+        self.assertEqual(submitted, [])
+        self.assertEqual(result.attempts, ())
+        self.assertEqual(result.stop_reason, "market_closed")
+
+    def test_other_guard_refusals_still_fail_the_chase(self):
+        for error in (
+            trade_workflow.OperationalFailure("Insufficient configured-account buying power"),
+            trade_workflow.ReconciliationFailure("Broker reconciliation found 1 unresolved discrepancy(ies)"),
+        ):
+            for name, run in ADAPTERS.items():
+                with self.subTest(adapter=name, error=type(error).__name__), ExitStack() as stack:
+                    submitted = chase_patches(stack, paper_client())
+                    with self.assertRaises(type(error)):
+                        run(refuse_on_attempt(2, error))
+                self.assertEqual(len(submitted), 1)
+
+    def guard_with_clock(self, clock, deadline=10_000, **guard_kwargs):
+        client = Mock()
+        client.get_clock.return_value = clock
+        with (
+            patch.object(trade_workflow, "reconcile_broker_state"),
+            patch.object(trade_workflow, "account_snapshot", return_value=(Decimal("100000"), Decimal("100000"))),
+            patch.object(trade_workflow, "exposure_cents", return_value=0),
+            patch.object(trade_workflow.time_module, "monotonic", return_value=0),
+        ):
+            trade_workflow.before_submit_guard(deadline=deadline, **guard_kwargs)(
+                client, {"limit_price": Decimal("0.70"), "quantity": 3}
+            )
+
+    def open_clock(self, minutes_to_close=120):
+        now = datetime.now(timezone.utc)
+        return SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(minutes=minutes_to_close))
+
+    def test_the_guard_marks_only_timing_refusals_as_timing(self):
+        for label, clock, deadline, reason in (
+            ("time budget", self.open_clock(), 59, "order_time_budget_reached"),
+            ("market closed", SimpleNamespace(is_open=False), 10_000, "market_closed"),
+            ("pre-close cutoff", self.open_clock(minutes_to_close=2), 10_000, "close_cutoff_reached"),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(trade_workflow.SubmissionWindowClosed) as caught:
+                    self.guard_with_clock(clock, deadline)
+                self.assertEqual(caught.exception.stop_reason, reason)
+                # Outside an adapter it still fails closed.
+                self.assertIsInstance(caught.exception, trade_workflow.OperationalFailure)
+
+    def test_an_unclear_clock_or_a_risk_limit_is_not_a_timing_refusal(self):
+        cases = (
+            ("clock without is_open", SimpleNamespace(), {}),
+            ("buying power", self.open_clock(), {"opening": True, "allocation_cents": 10}),
+        )
+        for label, clock, kwargs in cases:
+            with self.subTest(label):
+                with self.assertRaises(trade_workflow.OperationalFailure) as caught:
+                    self.guard_with_clock(clock, **kwargs)
+                self.assertNotIsInstance(caught.exception, alpaca_integration.SubmissionTimingRefusal)
+
+    def test_an_open_that_meets_the_close_mid_chase_leaves_a_retryable_no_fill(self):
+        now = datetime.now(timezone.utc)
+        client = paper_client()
+        client.get_clock.side_effect = [
+            SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2)),
+            SimpleNamespace(is_open=False),
+        ]
+        with ExitStack() as stack:
+            mocks = candidate_patches(stack, place_calendar_spread_order=alpaca_integration.place_calendar_spread_order)
+            # The same 0.20 x 0.50 market the candidate was planned against.
+            quotes = alpaca_integration.SpreadQuoteSnapshot(Decimal("0.50"), Decimal("0.60"), Decimal("0.80"), Decimal("1.00"))
+            submitted = chase_patches(stack, client, quotes)
+            for name, value in (
+                ("reconcile_broker_state", Mock()),
+                ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                ("exposure_cents", Mock(return_value=0)),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            open_one()
+        self.assertEqual(len(submitted), 1)
+        result = mocks["mark_no_fill"].call_args.args[1]
+        self.assertEqual(result.stop_reason, "market_closed")
+        mocks["finalize_execution"].assert_called_once_with("trade-GOOD", result)
+
+    def test_a_due_close_stopped_by_timing_is_deferred_with_a_warning(self):
+        trade = {
+            "trade_id": "trade-due", "Open Date": "2026-10-15", "When": "AMC",
+            "earnings_date": "2026-10-15", "remaining_quantity": 3,
+            "Short Symbol": "SHORT", "Long Symbol": "LONG",
+        }
+        now = datetime.now(timezone.utc)
+        client = paper_client()
+        client.get_clock.side_effect = [
+            SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2)),
+            SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(minutes=2)),
+        ]
+        output = io.StringIO()
+        with ExitStack() as stack:
+            chase_patches(stack, client)
+            for name, value in (
+                ("get_open_trades", Mock(return_value=[trade])),
+                ("is_time_to_close", Mock(return_value=True)),
+                ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                ("reserve_operation_prefix", Mock(return_value="prefix")),
+                ("reconcile_broker_state", Mock()),
+                ("finalize_execution", Mock()),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=0))
+            stack.enter_context(redirect_stdout(output))
+            failures = trade_workflow.close_due_trades(
+                object(), {"resolutions": {"trade-due": "MATCHED_SPREAD"}}, 10_000
+            )
+            finalize = trade_workflow.finalize_execution
+        self.assertEqual(failures, [])
+        self.assertEqual(finalize.call_args.args[1].stop_reason, "close_cutoff_reached")
+        self.assertIn("::warning title=Due close deferred::trade=trade-due remaining=3", output.getvalue())
+
+
+class RunTimeBudgetTests(unittest.TestCase):
+    """The 35-minute run budget and the pre-close cutoff defer work instead of failing."""
+
+    DUE = {"trade_id": "trade-due", "Open Date": "2026-10-15", "When": "AMC", "earnings_date": "2026-10-15"}
+
+    def close_due(self, *, monotonic=0, market_close=None):
+        output = io.StringIO()
+        with (
+            patch.object(trade_workflow, "get_open_trades", return_value=[self.DUE]),
+            patch.object(trade_workflow, "is_time_to_close", return_value=True),
+            patch.object(trade_workflow.time_module, "monotonic", return_value=monotonic),
+            patch.object(trade_workflow, "account_snapshot") as snapshot,
+            patch.object(trade_workflow, "close_calendar_spread_order") as close_order,
+            redirect_stdout(output),
+        ):
+            failures = trade_workflow.close_due_trades(object(), {"resolutions": {}}, 10_000, market_close)
+        return failures, close_order, snapshot, output.getvalue()
+
+    def test_due_closes_past_the_run_budget_are_deferred_not_failed(self):
+        failures, close_order, snapshot, output = self.close_due(monotonic=9_950)
+        self.assertEqual(failures, [])
+        close_order.assert_not_called()
+        snapshot.assert_not_called()
+        self.assertIn("::warning title=Due close deferred::Run time ran out", output)
+
+    def test_due_closes_after_the_pre_close_cutoff_are_deferred_not_failed(self):
+        closing = datetime.now(EASTERN) + timedelta(minutes=2)
+        failures, close_order, _snapshot, output = self.close_due(market_close=closing)
+        self.assertEqual(failures, [])
+        close_order.assert_not_called()
+        self.assertIn("::warning title=Due close deferred::The pre-close cutoff", output)
+
+    def opening_run(self, open_candidate, monotonic=0):
+        class Afternoon(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 14, 14, 10, tzinfo=EASTERN)
+
+        clock = SimpleNamespace(
+            next_close=Afternoon(2026, 10, 14, 16, 0, tzinfo=EASTERN),
+            next_open=Afternoon(2026, 10, 15, 9, 30, tzinfo=EASTERN),
+        )
+        record = lambda symbol: {"act_symbol": symbol, "when": "before market open"}
+        with (
+            kelly_inputs(),
+            patch.object(trade_workflow, "datetime", Afternoon),
+            patch.object(trade_workflow.time_module, "monotonic", return_value=monotonic),
+            patch.object(trade_workflow, "get_todays_earnings", return_value=[]) as todays,
+            patch.object(trade_workflow, "get_tomorrows_earnings", return_value=[record("BNY"), record("CLF")]),
+            patch.object(trade_workflow, "open_candidate", open_candidate),
+        ):
+            trade_workflow.open_new_positions(object(), clock, 10_000)
+        return todays
+
+    def test_running_out_of_run_time_skips_the_remaining_candidates(self):
+        open_candidate = Mock(side_effect=trade_workflow.RunTimeBudgetReached("Run time budget reached before candidate processing"))
+        self.opening_run(open_candidate)
+        open_candidate.assert_called_once()
+
+    def test_no_earnings_are_fetched_once_the_run_time_is_spent(self):
+        open_candidate = Mock()
+        todays = self.opening_run(open_candidate, monotonic=9_950)
+        todays.assert_not_called()
+        open_candidate.assert_not_called()
+
+    def test_open_candidate_raises_the_budget_stop_rather_than_a_run_failure(self):
+        with ExitStack() as stack:
+            candidate_patches(stack)
+            stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=9_950))
+            with self.assertRaises(trade_workflow.RunTimeBudgetReached):
+                open_one()
 
 
 if __name__ == "__main__":
