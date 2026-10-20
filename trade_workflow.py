@@ -1007,6 +1007,22 @@ def fetch_orders(client):
         raise OperationalFailure(f"Unable to fetch broker orders: {redact(exc)}") from exc
 
 
+def reread_order(client,order):
+    """Read one order by ID; if that fails, keep the listed state, which still counts as active."""
+    oid=order_id(order)
+    try:
+        from alpaca.trading.requests import GetOrderByIdRequest
+        current=client.get_order_by_id(oid,GetOrderByIdRequest(nested=True))
+    except Exception as exc:
+        print(f"Could not re-read broker order {oid}: {redact(exc)}",file=sys.stderr)
+        return order
+    if order_id(current)!=oid:
+        print(f"Re-reading broker order {oid} returned a different order; keeping the listed state.",file=sys.stderr)
+        return order
+    print(f"Broker order list showed {oid} as {enum_text(getattr(order,'status',''))}; reading it directly shows {enum_text(getattr(current,'status',''))}.")
+    return current
+
+
 def position_maps(positions):
     options,equities={},{}
     for position in positions:
@@ -1139,6 +1155,13 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
     try: positions=list(client.get_all_positions())
     except Exception as exc: raise OperationalFailure(f"Unable to fetch broker positions: {redact(exc)}") from exc
     orders=fetch_orders(client)
+    # Alpaca's order list can still show an order as active just after the bot
+    # confirmed its cancellation by reading the order itself, so such an order
+    # is read again by ID. One that is still active stops the run as before.
+    with db(read_only=read_only) as conn:
+        confirmed_inactive={row[0] for row in conn.execute("SELECT order_id FROM broker_orders WHERE terminal=1")}
+    orders=[reread_order(client,order) if order_id(order) in confirmed_inactive and not is_terminal_order(order) else order
+            for order in orders]
     if not read_only:
         with db() as conn:
             linked=[]

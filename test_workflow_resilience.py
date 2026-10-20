@@ -1202,5 +1202,119 @@ class ReplannedOpenTests(unittest.TestCase):
         self.assertEqual(self.reconcile()["discrepancies"], [])
 
 
+class StaleOrderListTests(unittest.TestCase):
+    """DHR on 2026-10-20: a cancel the bot had confirmed still showed as pending_cancel in the order list."""
+
+    TRADE_ID = "4fbaa0c4-96ab-5ad2-b5a5-37713bcf909f"
+    SHORT, LONG = "DHR261023C00225000", "DHR261120C00225000"
+    CLIENT_ORDER_ID = "eta-o-4fbaa0c496ab5ad2b5a5-0001-open-1"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for patcher in (
+            patch.object(trade_workflow, "DB_PATH", Path(directory.name) / "trades.db"),
+            patch.dict(os.environ, {"ALPACA_PAPER": "true", "APCA_API_BASE_URL": "https://paper-api.alpaca.markets"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        trade_workflow.init_db()
+        fingerprint = trade_workflow.hashlib.sha256(b"alpaca-account-id:v1:account").hexdigest()
+        with trade_workflow.db(write=True) as conn:
+            conn.execute(
+                "INSERT INTO broker_identity VALUES(1,'PAPER',?,'https://paper-api.alpaca.markets','bound','bound')",
+                (fingerprint,),
+            )
+            conn.execute(
+                """INSERT INTO trades("Ticker","When","Short Symbol","Long Symbol","Open Date",earnings_date,trade_id,
+                parent_trade_id,ordered_quantity,filled_quantity,remaining_quantity,lifecycle_status,
+                open_client_order_prefix,open_generation)
+                VALUES('DHR','BMO',?,?,'2026-10-20','2026-10-21',?,?,2,0,0,'OPEN_ORDER_SUBMITTED',?,1)""",
+                (self.SHORT, self.LONG, self.TRADE_ID, self.TRADE_ID, self.CLIENT_ORDER_ID[:-7]),
+            )
+            # The cancel the chase confirmed by reading the order itself.
+            conn.execute(
+                """INSERT INTO broker_orders(order_id,trade_id,client_order_id,phase,method,ordered_quantity,
+                canceled_quantity,remaining_quantity,limit_price,lifecycle_status,terminal,stop_reason,updated_at)
+                VALUES('order-1',?,?,'open','calendar_spread',2,2,2,'4.23','canceled',1,'deadline_cancel_confirmed','now')""",
+                (self.TRADE_ID, self.CLIENT_ORDER_ID),
+            )
+
+    def order(self, status):
+        return SimpleNamespace(
+            id="order-1", client_order_id=self.CLIENT_ORDER_ID, status=status, qty="2", filled_qty="0",
+            symbol="", order_class="mleg", time_in_force="day", type="limit", asset_class="us_option",
+            limit_price="4.23", legs=[
+                SimpleNamespace(symbol=self.SHORT, ratio_qty="1", side="sell", position_intent="sell_to_open"),
+                SimpleNamespace(symbol=self.LONG, ratio_qty="1", side="buy", position_intent="buy_to_open"),
+            ],
+        )
+
+    def client(self, direct):
+        """The order list says pending_cancel; ``direct`` is what reading the order by ID returns or raises."""
+        now = datetime.now(timezone.utc)
+        client = paper_client()
+        client.get_account.return_value = SimpleNamespace(id="account", equity="100000", options_buying_power="100000")
+        client.get_all_positions.return_value = []
+        client.get_orders.side_effect = lambda filter=None: [self.order("pending_cancel")]
+        client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+        if isinstance(direct, Exception):
+            client.get_order_by_id.side_effect = direct
+        else:
+            client.get_order_by_id.return_value = self.order(direct)
+        return client
+
+    def reconcile(self, client, read_only=True):
+        output = io.StringIO()
+        with redirect_stdout(output), patch("sys.stderr", io.StringIO()):
+            try:
+                return trade_workflow.reconcile_broker_state(client, read_only=read_only), output.getvalue()
+            except trade_workflow.ReconciliationFailure:
+                return None, output.getvalue()
+
+    def ledger_order(self):
+        with trade_workflow.db() as conn:
+            return tuple(conn.execute("SELECT lifecycle_status, terminal FROM broker_orders WHERE order_id='order-1'").fetchone())
+
+    def test_the_next_order_of_the_chase_is_admitted_once_a_direct_read_confirms_the_cancel(self):
+        client = self.client("canceled")
+        guard = trade_workflow.before_submit_guard(
+            900_000, opening=True, deadline=10_000, order_timing={"attempt_timeout": 10, "cancel_timeout": 30},
+        )
+        with redirect_stdout(io.StringIO()), patch.object(trade_workflow.time_module, "monotonic", return_value=0):
+            guard(client, {"limit_price": Decimal("4.40"), "quantity": 2})
+        self.assertEqual(client.get_order_by_id.call_args.args[0], "order-1")
+
+    def test_a_stale_listing_of_a_confirmed_cancel_is_not_a_discrepancy(self):
+        client = self.client("canceled")
+        result, output = self.reconcile(client)
+        self.assertEqual(result["discrepancies"], [])
+        client.get_order_by_id.assert_called_once()
+        self.assertIn("showed order-1 as pending_cancel; reading it directly shows canceled", output)
+
+    def test_an_order_still_active_when_read_directly_still_stops_the_run(self):
+        for status in ("pending_cancel", "new", "partially_filled"):
+            with self.subTest(status=status):
+                result, _ = self.reconcile(self.client(status))
+                self.assertIsNone(result)
+
+    def test_a_failed_direct_read_still_stops_the_run(self):
+        result, _ = self.reconcile(self.client(RuntimeError("timeout")))
+        self.assertIsNone(result)
+
+    def test_an_order_the_ledger_never_saw_end_is_not_re_read(self):
+        with trade_workflow.db(write=True) as conn:
+            conn.execute("UPDATE broker_orders SET terminal=0, lifecycle_status='new'")
+        client = self.client("canceled")
+        result, _ = self.reconcile(client)
+        self.assertIsNone(result)
+        client.get_order_by_id.assert_not_called()
+
+    def test_start_of_run_reconciliation_keeps_the_confirmed_cancel_in_the_ledger(self):
+        result, _ = self.reconcile(self.client("canceled"), read_only=False)
+        self.assertEqual(result["discrepancies"], [])
+        self.assertEqual(self.ledger_order(), ("canceled", 1))
+
+
 if __name__ == "__main__":
     unittest.main()
