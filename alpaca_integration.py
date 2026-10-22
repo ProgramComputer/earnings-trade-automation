@@ -29,9 +29,9 @@ DEFAULT_CANCEL_TIMEOUT = 20
 DEFAULT_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("QUOTE_MAX_AGE_SECONDS") or "120")
 DEFAULT_QUOTE_FETCH_ATTEMPTS = 3
 DEFAULT_QUOTE_RETRY_DELAY_SECONDS = 2
-# Opening prices step a tenth of the net market's width: five steps from the
-# midpoint to the ask. Closing orders keep quarter-width steps.
-OPENING_CHASE_DIVISIONS = 10
+# Every chase steps a tenth of the market's width: five steps from the
+# midpoint to the natural price.
+CHASE_DIVISIONS = 10
 _OPTION_CHAIN_CACHE = {}
 
 
@@ -514,9 +514,9 @@ def _client_order_id(prefix, operation, attempt_number):
     return f"{safe[:max(1, 48 - len(suffix))]}{suffix}"
 
 
-def _chase_step(lower, upper, divisions=4):
+def _chase_step(lower, upper):
     width = max(upper - lower, Decimal("0"))
-    return max((width / Decimal(divisions)).quantize(CENT, rounding=ROUND_CEILING), CENT)
+    return max((width / Decimal(CHASE_DIVISIONS)).quantize(CENT, rounding=ROUND_CEILING), CENT)
 
 
 def _durable_attempt_callback(on_terminal, on_filled):
@@ -846,7 +846,7 @@ def place_calendar_spread_order(
         proposed = (
             starting_limit
             if previous_limit is None
-            else previous_limit + _chase_step(net_bid, net_ask, OPENING_CHASE_DIVISIONS)
+            else previous_limit + _chase_step(net_bid, net_ask)
         )
         upper_bound = min(net_ask, attempt_ceiling)
         if upper_bound <= 0:
@@ -1040,7 +1040,9 @@ def close_calendar_spread_order(
 
     Exactly one hard price policy is required: ``max_close_debit`` is the most
     positive signed limit allowed, while ``min_close_credit`` becomes a negative
-    signed ceiling. Quotes and the net spread are recalculated before every try.
+    signed ceiling. Quotes and the net spread are recalculated before every try,
+    and the chase keeps offering the market's price until its attempts or time
+    run out; only the hard ceiling stops it early.
     ``on_terminal`` receives cumulative fill progress and every safely inactive
     attempt; ``on_order_state`` persists terminal state independently of fill
     accounting. ``on_filled`` remains the backward-compatible fill callback alias.
@@ -1107,7 +1109,10 @@ def close_calendar_spread_order(
         )
         if attempt_limit > hard_ceiling:
             raise OrderExecutionError("Closing price calculation exceeded its hard signed ceiling")
-        if attempt_limit in attempted_prices:
+        # A due position must still close, so a price already tried is offered
+        # again while it is the market's own price; only the hard ceiling ends
+        # the chase early.
+        if attempt_limit in attempted_prices and attempt_limit >= hard_ceiling:
             stop_reason = "hard_price_limit_reached"
             break
 
