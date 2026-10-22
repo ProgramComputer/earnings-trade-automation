@@ -65,6 +65,9 @@ OPEN_CEILING_FOLLOW_PCT = Decimal(os.environ.get("OPEN_CEILING_FOLLOW_PCT") or "
 # Alpaca PAPER filled 7 of the 8 filled entries within 0.25 s of submission
 # (LEVI took 10 s), so an opening price waits briefly before the next step.
 OPEN_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_timeout": 30}
+# Closes wait as briefly; nine due closes that never fill still fit the
+# 35-minute run.
+CLOSE_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_timeout": 30}
 # Quotes, the submit guard, submission and cancel confirmation add 0.4-1.1 s.
 ORDER_ATTEMPT_OVERHEAD_SECONDS = 1
 UUID_NAMESPACE = uuid.UUID("f8eaa5b8-685f-4d83-9308-b426ad5f95a1")
@@ -1307,8 +1310,8 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
             break
         tid=trade["trade_id"]; qty=int(trade["remaining_quantity"] or 0); state=reconciliation["resolutions"].get(tid)
         account_snapshot(client)
-        operation_deadline=min(time_module.monotonic()+240,run_deadline)
-        common={"max_attempts":8,"overall_timeout":240,"attempt_timeout":30,"cancel_timeout":30}
+        operation_deadline=min(time_module.monotonic()+CLOSE_ORDER_TIMING["overall_timeout"],run_deadline)
+        common={"max_attempts":chase_attempts(CLOSE_ORDER_TIMING),**CLOSE_ORDER_TIMING}
         try:
             if state=="MATCHED_SPREAD":
                 method="calendar_spread"

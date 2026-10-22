@@ -1036,6 +1036,111 @@ class OverdueExitTests(unittest.TestCase):
         self.assertIn("- Overdue exits: 0\n", summary)
 
 
+def filled_attempt(order_id, quantity, price):
+    return alpaca_integration.OrderLifecycleResult(
+        order_id=order_id, symbol="SHORT", ordered_qty=quantity, filled_qty=quantity,
+        canceled_qty=0, remaining_qty=0, status="filled", terminal=True, timed_out=False,
+        cancel_confirmed=False, average_fill_price=Decimal(price), commission_amount=None,
+        stop_reason="fully_filled", raw_order=None,
+    )
+
+
+class ExitChaseTests(unittest.TestCase):
+    """CME on 2026-10-21: the close stopped after 3 tries when the market came back to a price already tried."""
+
+    def chase(self, wait, **kwargs):
+        """Close a 3-lot spread in a quiet net 0.80 x 0.65 credit market; return the limits sent and the result."""
+        sent = []
+
+        def submit(_client, request, client_order_id):
+            sent.append(Decimal(str(request.limit_price)))
+            return SimpleNamespace(id=f"order-{len(sent)}")
+
+        with ExitStack() as stack:
+            chase_patches(stack, paper_client())
+            for name, value in (
+                ("_submit_order_idempotently", Mock(side_effect=submit)),
+                ("wait_for_fill", Mock(side_effect=wait)),
+            ):
+                stack.enter_context(patch.object(alpaca_integration, name, value))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            result = alpaca_integration.close_calendar_spread_order(
+                "SHORT", "LONG", 3, client_order_id_prefix="test", max_attempts=13,
+                **{"max_close_debit": Decimal("0.50"), **kwargs},
+            )
+        return sent, result
+
+    def test_a_close_offers_the_market_price_again_and_can_still_fill(self):
+        def wait(_client, order_id, **kwargs):
+            if order_id == "order-6":
+                return filled_attempt(order_id, kwargs["expected_qty"], "-0.65")
+            return canceled_attempt(order_id, kwargs["expected_qty"])
+
+        sent, result = self.chase(wait)
+        # A tenth of the 0.15 width per step from the midpoint, then the market's price again.
+        self.assertEqual(sent, [Decimal(price) for price in ("-0.73", "-0.71", "-0.69", "-0.67", "-0.65", "-0.65")])
+        self.assertEqual((result.filled_qty, result.stop_reason), (3, "requested_quantity_filled"))
+
+    def test_an_unfilled_close_keeps_trying_until_its_attempts_run_out(self):
+        sent, result = self.chase(lambda _client, order_id, **kwargs: canceled_attempt(order_id, kwargs["expected_qty"]))
+        self.assertEqual(len(sent), 13)
+        self.assertEqual(sent[-1], Decimal("-0.65"))
+        self.assertEqual(result.stop_reason, "max_attempts_reached")
+
+    def test_a_close_pinned_at_its_hard_limit_still_stops(self):
+        # Requiring a 0.70 credit caps the price below the 0.65 market.
+        sent, result = self.chase(
+            lambda _client, order_id, **kwargs: canceled_attempt(order_id, kwargs["expected_qty"]),
+            max_close_debit=None, min_close_credit=Decimal("0.70"),
+        )
+        self.assertEqual(sent, [Decimal("-0.73"), Decimal("-0.71"), Decimal("-0.70")])
+        self.assertEqual(result.stop_reason, "hard_price_limit_reached")
+
+    def test_a_due_close_uses_all_the_attempts_that_fit_in_its_time(self):
+        # Each attempt waits out its timeout plus the measured second of broker calls.
+        now = {"seconds": 0.0}
+
+        def wait(_client, order_id, **kwargs):
+            now["seconds"] += kwargs["timeout"] + 1
+            return canceled_attempt(order_id, kwargs["expected_qty"])
+
+        trade = {
+            "trade_id": "trade-CME", "Ticker": "CME", "Open Date": "2026-10-20", "When": "BMO",
+            "earnings_date": "2026-10-21", "remaining_quantity": 2, "Short Symbol": "SHORT", "Long Symbol": "LONG",
+        }
+        client = paper_client()
+        clock_now = datetime.now(timezone.utc)
+        client.get_clock.return_value = SimpleNamespace(
+            is_open=True, timestamp=clock_now, next_close=clock_now + timedelta(hours=2),
+        )
+        close = Mock(side_effect=alpaca_integration.close_calendar_spread_order)
+        sent = []
+        with ExitStack() as stack:
+            chase_patches(stack, client)
+            stack.enter_context(patch.object(alpaca_integration, "wait_for_fill", Mock(side_effect=wait)))
+            stack.enter_context(patch.object(
+                alpaca_integration, "_submit_order_idempotently",
+                Mock(side_effect=lambda _client, request, _id: sent.append(request) or SimpleNamespace(id=f"order-{len(sent)}")),
+            ))
+            stack.enter_context(patch.object(alpaca_integration.time, "monotonic", side_effect=lambda: now["seconds"]))
+            for name, value in (
+                ("get_open_trades", Mock(return_value=[trade])),
+                ("is_time_to_close", Mock(return_value=True)),
+                ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                ("reconcile_broker_state", Mock()),
+                ("reserve_operation_prefix", Mock(return_value="prefix")),
+                ("finalize_execution", Mock()),
+                ("close_calendar_spread_order", close),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            trade_workflow.close_due_trades(object(), {"resolutions": {"trade-CME": "MATCHED_SPREAD"}}, 100_000)
+        kwargs = close.call_args.kwargs
+        self.assertLessEqual(kwargs["attempt_timeout"], 10)
+        self.assertEqual(len(sent), kwargs["max_attempts"])
+        self.assertGreater(len(sent), 8)
+
+
 class ReplannedOpenTests(unittest.TestCase):
     """A same-day retry of an unfilled open must not break the check of its earlier orders."""
 
