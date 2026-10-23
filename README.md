@@ -91,7 +91,8 @@ Set these as repository variables under **Settings > Secrets and variables > Act
 | Variable | Default | Meaning |
 |---|---|---|
 | `ENTRY_WINDOW_MINUTES` | `240` | New entries may start this many minutes before the close (from noon on a regular session) and stop 3 minutes before it, so a run GitHub starts late can still trade. `25` restores the strategy's late-day entry. |
-| `QUOTE_MAX_AGE_SECONDS` | `120` | Oldest option quote accepted for pricing an order. Thinly traded contracts often keep an unchanged quote for more than 30 seconds. |
+| `QUOTE_MAX_AGE_SECONDS` | `120` | Oldest option quote accepted for pricing an entry. Thinly traded contracts often keep an unchanged quote for more than 30 seconds. |
+| `CLOSE_QUOTE_MAX_AGE_SECONDS` | `900` | Oldest option quote accepted for pricing a due close, up to `3600`. An option near expiry can keep an unchanged quote for many minutes; a close is still a limit order within `MAX_CLOSE_DEBIT`. |
 | `OPEN_MAX_DEBIT_SPREAD_FRACTION` | `1` | How far from the spread's midpoint toward its ask an opening order may go. Orders start at the midpoint and step up a tenth of the spread's width at a time; on Alpaca PAPER no first order at the midpoint has filled, and fills come near the ask. |
 | `OPEN_CEILING_FOLLOW_PCT` | `0.05` | If the ask rises during an entry, the price may follow it up to this share above the planned ceiling (0 to 0.25), still within the position and exposure limits. |
 | `OPEN_MAX_SPREAD_WIDTH_PCT` | unset | Skip an entry whose net spread (ask − bid) is wider than this share of its midpoint, e.g. `0.75`. Unset accepts any width; every entry filled through October 2026 was at least 30% wide. Each run logs every candidate's width. |

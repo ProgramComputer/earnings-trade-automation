@@ -68,6 +68,10 @@ OPEN_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_time
 # Closes wait as briefly; nine due closes that never fill still fit the
 # 35-minute run.
 CLOSE_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_timeout": 30}
+# Oldest quote a due close may price from. An option near expiry can keep
+# an unchanged quote for many minutes (PHM's expiring short was 620 s old on
+# 2026-10-22), and a close stays a limit order within MAX_CLOSE_DEBIT.
+CLOSE_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("CLOSE_QUOTE_MAX_AGE_SECONDS") or "900")
 # Quotes, the submit guard, submission and cancel confirmation add 0.4-1.1 s.
 ORDER_ATTEMPT_OVERHEAD_SECONDS = 1
 UUID_NAMESPACE = uuid.UUID("f8eaa5b8-685f-4d83-9308-b426ad5f95a1")
@@ -1311,7 +1315,7 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
         tid=trade["trade_id"]; qty=int(trade["remaining_quantity"] or 0); state=reconciliation["resolutions"].get(tid)
         account_snapshot(client)
         operation_deadline=min(time_module.monotonic()+CLOSE_ORDER_TIMING["overall_timeout"],run_deadline)
-        common={"max_attempts":chase_attempts(CLOSE_ORDER_TIMING),**CLOSE_ORDER_TIMING}
+        common={"max_attempts":chase_attempts(CLOSE_ORDER_TIMING),**CLOSE_ORDER_TIMING,"quote_max_age_seconds":CLOSE_QUOTE_MAX_AGE_SECONDS}
         try:
             if state=="MATCHED_SPREAD":
                 method="calendar_spread"
@@ -1503,6 +1507,8 @@ def run_trade_workflow():
         raise OperationalFailure("OPEN_CEILING_FOLLOW_PCT must be between zero and 0.25")
     if not 0<DEFAULT_QUOTE_MAX_AGE_SECONDS<=900:
         raise OperationalFailure("QUOTE_MAX_AGE_SECONDS must be greater than zero and no more than 900")
+    if not 0<CLOSE_QUOTE_MAX_AGE_SECONDS<=3600:
+        raise OperationalFailure("CLOSE_QUOTE_MAX_AGE_SECONDS must be greater than zero and no more than 3600")
     client,broker_mode=configured_broker_client()
     broker_identity=bind_or_validate_broker_identity(client,broker_mode,allow_bind=True)
     reconciliation=reconcile_broker_state(client,read_only=False,broker_mode=broker_mode,broker_identity=broker_identity)

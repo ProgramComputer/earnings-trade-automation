@@ -1141,6 +1141,108 @@ class ExitChaseTests(unittest.TestCase):
         self.assertGreater(len(sent), 8)
 
 
+class CloseQuoteAgeTests(unittest.TestCase):
+    """PHM on 2026-10-22: the expiring short's quote was 620 s old, so its due close failed."""
+
+    SHORT, LONG = "PHM261023C00115000", "PHM261120C00115000"
+
+    def quotes(self, short_age):
+        now = datetime.now(timezone.utc)
+        quote = lambda bid, ask, age: SimpleNamespace(
+            bid_price=bid, ask_price=ask, bid_size=10, ask_size=10, timestamp=now - timedelta(seconds=age),
+        )
+        data = Mock()
+        data.get_option_latest_quote.return_value = {
+            self.SHORT: quote("1.00", "1.10", short_age), self.LONG: quote("4.00", "4.30", 5),
+        }
+        return data
+
+    def close_phm(self, short_age, **settings):
+        """Run PHM's due close against real quote checks; return (failures, limits sent)."""
+        trade = {
+            "trade_id": "trade-PHM", "Ticker": "PHM", "Open Date": "2026-10-21", "When": "BMO",
+            "earnings_date": "2026-10-22", "remaining_quantity": 5, "Short Symbol": self.SHORT, "Long Symbol": self.LONG,
+        }
+        client = paper_client()
+        now = datetime.now(timezone.utc)
+        client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+        sent = []
+
+        def submit(_client, request, _client_order_id):
+            sent.append(Decimal(str(request.limit_price)))
+            return SimpleNamespace(id=f"order-{len(sent)}")
+
+        with ExitStack() as stack:
+            for name, value in (
+                ("init_alpaca_client", Mock(return_value=client)),
+                ("_require_explicit_trading_mode", Mock()),
+                ("OptionHistoricalDataClient", Mock(return_value=self.quotes(short_age))),
+                ("_submit_order_idempotently", Mock(side_effect=submit)),
+                ("_notify_submitted_order", Mock()),
+                ("_notify_terminal_attempt", Mock()),
+                ("wait_for_fill", Mock(side_effect=lambda _c, order_id, **kw: filled_attempt(order_id, kw["expected_qty"], "-3.10"))),
+            ):
+                stack.enter_context(patch.object(alpaca_integration, name, value))
+            stack.enter_context(patch.object(alpaca_integration.time, "sleep"))
+            for name, value in (
+                ("get_open_trades", Mock(return_value=[trade])),
+                ("is_time_to_close", Mock(return_value=True)),
+                ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
+                ("reconcile_broker_state", Mock()),
+                ("reserve_operation_prefix", Mock(return_value="prefix")),
+                ("finalize_execution", Mock()),
+                ("record_close_quote_failure", Mock(side_effect=lambda _tid, error: f"CLOSE_QUOTE_VALIDATION_FAILED: {error}")),
+                *settings.items(),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=0))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            stack.enter_context(patch("sys.stderr", io.StringIO()))
+            failures = trade_workflow.close_due_trades(object(), {"resolutions": {"trade-PHM": "MATCHED_SPREAD"}}, 10_000)
+        return failures, sent
+
+    def test_a_due_close_prices_from_a_quote_minutes_old(self):
+        failures, sent = self.close_phm(620)
+        self.assertEqual(failures, [])
+        self.assertEqual(sent, [Decimal("-3.10")])
+
+    def test_a_quote_older_than_the_close_limit_still_fails_the_close(self):
+        failures, sent = self.close_phm(1000)
+        self.assertEqual(sent, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("Stale quote for PHM261023C00115000", failures[0])
+        self.assertIn("allowed=900s", failures[0])
+
+    def test_cloners_can_set_the_close_limit(self):
+        failures, _ = self.close_phm(620, CLOSE_QUOTE_MAX_AGE_SECONDS=300)
+        self.assertIn("allowed=300s", failures[0])
+        workflow = (Path(__file__).resolve().parent / ".github" / "workflows" / "config.yml").read_text(encoding="utf-8")
+        self.assertIn("CLOSE_QUOTE_MAX_AGE_SECONDS: ${{ vars.CLOSE_QUOTE_MAX_AGE_SECONDS }}", workflow)
+
+    def test_entries_still_refuse_a_quote_older_than_two_minutes(self):
+        with (
+            patch.object(alpaca_integration, "_require_explicit_trading_mode"),
+            patch.object(alpaca_integration, "OptionHistoricalDataClient", Mock(return_value=self.quotes(620))),
+            patch.object(alpaca_integration.time, "sleep"),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(alpaca_integration.QuoteValidationError, "allowed=120s"):
+                alpaca_integration.get_spread_quotes(self.SHORT, self.LONG)
+
+    def test_an_invalid_close_limit_is_refused_before_contacting_the_broker(self):
+        for value in (0, 3601):
+            with (
+                self.subTest(value=value),
+                patch.object(trade_workflow, "CLOSE_QUOTE_MAX_AGE_SECONDS", value),
+                patch.object(trade_workflow, "configured_mode"),
+                patch.object(trade_workflow, "init_db"),
+                patch.object(trade_workflow, "configured_broker_client") as broker,
+            ):
+                with self.assertRaisesRegex(trade_workflow.OperationalFailure, "CLOSE_QUOTE_MAX_AGE_SECONDS"):
+                    trade_workflow.run_trade_workflow()
+            broker.assert_not_called()
+
+
 class ReplannedOpenTests(unittest.TestCase):
     """A same-day retry of an unfilled open must not break the check of its earlier orders."""
 
