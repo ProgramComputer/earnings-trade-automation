@@ -102,6 +102,7 @@ Set these as repository variables under **Settings > Secrets and variables > Act
 | `KELLY_FRACTION` | `0.10` | Share of full Kelly to bet. |
 | `POSITION_ALLOCATION_PCT` | `0.06` | Fixed share of equity per position, used until all three Kelly inputs are set. |
 | `MAX_AGGREGATE_EXPOSURE_PCT` | `0.36` | Cap on total open exposure as a share of equity. |
+| `EXPOSURE_CAP_HEADROOM_PCT` | `0.05` | Share of the exposure cap kept free when sizing an entry (0 to 0.5), so equity moving during the entry doesn't push its later orders over the cap. `0` sizes up to the full cap. |
 
 With the Kelly inputs set, each position gets `KELLY_FRACTION × (W − (1 − W) ÷ R)` of equity, where `W` is the win rate and `R` is the average win divided by the average loss. For example, `W = 0.60`, average win `0.40` and average loss `0.30` give a full Kelly of 30% and a 10% Kelly allocation of 3%. When the inputs show no edge, the bot opens nothing. Each run logs the sizing it used.
 

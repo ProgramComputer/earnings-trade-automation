@@ -47,6 +47,10 @@ KELLY_AVG_WIN = os.environ.get("KELLY_AVG_WIN")
 KELLY_AVG_LOSS = os.environ.get("KELLY_AVG_LOSS")
 # Positions last about a day, so this caps how many can open in one session.
 MAX_AGGREGATE_EXPOSURE_PCT = Decimal(os.environ.get("MAX_AGGREGATE_EXPOSURE_PCT") or "0.36")
+# Share of the exposure cap left unused when sizing an entry. The cap follows
+# live equity, which moves while an entry is chased; without room, an order
+# planned to fill the cap is refused mid-chase (RMBS, 2026-10-26).
+EXPOSURE_CAP_HEADROOM_PCT = Decimal(os.environ.get("EXPOSURE_CAP_HEADROOM_PCT") or "0.05")
 # Minutes before the broker close when new entries may start. The default
 # opens entries from noon on a regular session so a delayed scheduled run can
 # still trade; 25 restores the strategy's late-day entry.
@@ -1405,8 +1409,9 @@ def opening_prices(net_bid,net_ask):
 def candidate_allocation(client,spread_cost):
     equity,buying=account_snapshot(client); existing=exposure_cents()
     cap=dollars_to_cents(equity*MAX_AGGREGATE_EXPOSURE_PCT)
+    headroom=dollars_to_cents(equity*MAX_AGGREGATE_EXPOSURE_PCT*EXPOSURE_CAP_HEADROOM_PCT)
     per_position=dollars_to_cents(equity*position_allocation()[0])
-    allocation=min(per_position,max(0,cap-existing),dollars_to_cents(buying))
+    allocation=min(per_position,max(0,cap-existing-headroom),dollars_to_cents(buying))
     cost=abs(contract_cashflow_cents(spread_cost,1))
     return (allocation//cost if cost else 0),allocation,existing,cap
 
@@ -1493,6 +1498,8 @@ def run_trade_workflow():
     run_deadline=time_module.monotonic()+35*60
     if not Decimal(0)<POSITION_ALLOCATION_PCT<=Decimal(1) or not Decimal(0)<MAX_AGGREGATE_EXPOSURE_PCT<=Decimal(1):
         raise OperationalFailure("Exposure percentages must be greater than zero and no more than one")
+    if not (EXPOSURE_CAP_HEADROOM_PCT.is_finite() and Decimal(0)<=EXPOSURE_CAP_HEADROOM_PCT<=Decimal("0.5")):
+        raise OperationalFailure("EXPOSURE_CAP_HEADROOM_PCT must be between zero and 0.5")
     allocation_pct,sizing_basis=position_allocation()
     if allocation_pct>MAX_AGGREGATE_EXPOSURE_PCT:
         raise OperationalFailure("Per-position allocation exceeds aggregate exposure cap")

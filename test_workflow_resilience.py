@@ -1243,6 +1243,85 @@ class CloseQuoteAgeTests(unittest.TestCase):
             broker.assert_not_called()
 
 
+class ExposureCapHeadroomTests(unittest.TestCase):
+    """RMBS on 2026-10-26: sized to fill the cap, its 7th order was refused when equity dipped mid-chase."""
+
+    # $20,000 equity: a $7,200 cap with $6,000 already open leaves $1,200; 5% of the cap is $360.
+    EQUITY = Decimal("20000")
+    EXISTING = 600_000
+
+    def allocate(self, spread_cost, **settings):
+        with ExitStack() as stack:
+            stack.enter_context(kelly_inputs())
+            for name, value in (
+                ("account_snapshot", Mock(return_value=(self.EQUITY, Decimal("100000")))),
+                ("exposure_cents", Mock(return_value=self.EXISTING)),
+                *settings.items(),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            return trade_workflow.candidate_allocation(object(), Decimal(spread_cost))
+
+    def test_entries_are_sized_below_the_cap_by_its_headroom(self):
+        quantity, allocation, existing, cap = self.allocate("2.33")
+        self.assertEqual((existing, cap), (600_000, 720_000))
+        self.assertEqual(allocation, 84_000)
+        self.assertEqual(quantity, 3)
+
+    def test_zero_headroom_sizes_up_to_the_full_cap(self):
+        quantity, allocation, _, _ = self.allocate("2.33", EXPOSURE_CAP_HEADROOM_PCT=Decimal("0"))
+        self.assertEqual((quantity, allocation), (5, 120_000))
+
+    def test_an_entry_near_the_cap_survives_equity_dipping_mid_chase(self):
+        # Planning sees $20,000 of equity; every pre-order check after that sees $19,500,
+        # which lowers the cap by $180. Without headroom the 4th order would breach it.
+        snapshots = iter([(self.EQUITY, Decimal("100000"))])
+        account = Mock(side_effect=lambda _client: next(snapshots, (Decimal("19500"), Decimal("100000"))))
+        sent = []
+
+        def submit(_client, request, _client_order_id):
+            sent.append((Decimal(str(request.limit_price)), int(request.qty)))
+            return SimpleNamespace(id=f"order-{len(sent)}")
+
+        client = paper_client()
+        now = datetime.now(timezone.utc)
+        client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
+        with ExitStack() as stack:
+            mocks = candidate_patches(
+                stack, candidate_allocation=trade_workflow.candidate_allocation,
+                place_calendar_spread_order=alpaca_integration.place_calendar_spread_order,
+            )
+            # The same net 0.20 x 0.50 market the entry was planned against.
+            chase_patches(stack, client, snapshot("0.50", "0.60", "0.80", "1.00"))
+            stack.enter_context(patch.object(alpaca_integration, "_submit_order_idempotently", Mock(side_effect=submit)))
+            stack.enter_context(kelly_inputs())
+            for name, value in (
+                ("account_snapshot", account),
+                ("exposure_cents", Mock(return_value=self.EXISTING)),
+                ("reconcile_broker_state", Mock()),
+            ):
+                stack.enter_context(patch.object(trade_workflow, name, value))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            open_one()
+        result = mocks["finalize_execution"].call_args.args[1]
+        self.assertEqual(result.stop_reason, "hard_price_limit_reached")
+        self.assertEqual(sent[-1], (Decimal("0.50"), 16))
+
+    def test_the_headroom_is_a_repository_variable_and_is_validated(self):
+        workflow = (Path(__file__).resolve().parent / ".github" / "workflows" / "config.yml").read_text(encoding="utf-8")
+        self.assertIn("EXPOSURE_CAP_HEADROOM_PCT: ${{ vars.EXPOSURE_CAP_HEADROOM_PCT }}", workflow)
+        for value in (Decimal("-0.01"), Decimal("0.6"), Decimal("NaN")):
+            with (
+                self.subTest(value=value),
+                patch.object(trade_workflow, "EXPOSURE_CAP_HEADROOM_PCT", value),
+                patch.object(trade_workflow, "configured_mode"),
+                patch.object(trade_workflow, "init_db"),
+                patch.object(trade_workflow, "configured_broker_client") as broker,
+            ):
+                with self.assertRaisesRegex(trade_workflow.OperationalFailure, "EXPOSURE_CAP_HEADROOM_PCT"):
+                    trade_workflow.run_trade_workflow()
+            broker.assert_not_called()
+
+
 class ReplannedOpenTests(unittest.TestCase):
     """A same-day retry of an unfilled open must not break the check of its earlier orders."""
 
