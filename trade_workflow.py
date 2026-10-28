@@ -1002,16 +1002,37 @@ def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_deb
     return guard
 
 
+# Alpaca returns at most this many orders per request.
+ORDER_PAGE_SIZE=500
+
+
+def order_pages(client,status,after=None):
+    """Every order Alpaca lists for a query, read newest first one page at a time."""
+    from alpaca.common.enums import Sort
+    from alpaca.trading.requests import GetOrdersRequest
+    orders={}; until=None
+    while True:
+        page=list(client.get_orders(filter=GetOrdersRequest(
+            status=status,after=after,until=until,limit=ORDER_PAGE_SIZE,nested=True,direction=Sort.DESC)))
+        added=0
+        for order in page:
+            if order_id(order) not in orders:
+                orders[order_id(order)]=order; added+=1
+        if len(page)<ORDER_PAGE_SIZE:
+            return list(orders.values())
+        submitted=[getattr(order,"submitted_at",None) or getattr(order,"created_at",None) for order in page]
+        if not added or not all(isinstance(moment,datetime) for moment in submitted):
+            raise OperationalFailure("Broker order history could not be read past a full page")
+        # The next page starts at this page's oldest order, which is read again
+        # and skipped, so orders submitted in the same instant are not missed.
+        until=min(submitted)+timedelta(microseconds=1)
+
+
 def fetch_orders(client):
     try:
         from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-        open_request=GetOrdersRequest(status=QueryOrderStatus.OPEN,limit=500,nested=True)
-        recent_request=GetOrdersRequest(status=QueryOrderStatus.ALL,after=datetime.now(timezone.utc)-timedelta(days=30),limit=500,nested=True)
-        open_orders=list(client.get_orders(filter=open_request))
-        recent_orders=list(client.get_orders(filter=recent_request))
-        if len(open_orders)>=500 or len(recent_orders)>=500:
-            raise OperationalFailure("Broker order history reached the 500-order safety limit; pagination is required")
+        open_orders=order_pages(client,QueryOrderStatus.OPEN)
+        recent_orders=order_pages(client,QueryOrderStatus.ALL,after=datetime.now(timezone.utc)-timedelta(days=30))
         deduplicated={order_id(order):order for order in open_orders+recent_orders}
         return list(deduplicated.values())
     except Exception as exc:
