@@ -51,6 +51,7 @@ jobs:
       KELLY_AVG_WIN: ${{ vars.KELLY_AVG_WIN }}
       KELLY_AVG_LOSS: ${{ vars.KELLY_AVG_LOSS }}
       MAX_AGGREGATE_EXPOSURE_PCT: ${{ vars.MAX_AGGREGATE_EXPOSURE_PCT }}
+      EXPOSURE_CAP_HEADROOM_PCT: ${{ vars.EXPOSURE_CAP_HEADROOM_PCT }}
 
     steps:
       - name: Checkout code
