@@ -74,8 +74,15 @@ OPEN_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_time
 CLOSE_ORDER_TIMING = {"overall_timeout": 180, "attempt_timeout": 10, "cancel_timeout": 30}
 # Oldest quote a due close may price from. An option near expiry can keep
 # an unchanged quote for many minutes (PHM's expiring short was 620 s old on
-# 2026-10-22), and a close stays a limit order within MAX_CLOSE_DEBIT.
+# 2026-10-22), and a close stays a limit order priced from that quote.
 CLOSE_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("CLOSE_QUOTE_MAX_AGE_SECONDS") or "900")
+# Most a due close pays as a net debit while its short leg has time left.
+MAX_CLOSE_DEBIT = Decimal(os.environ.get("MAX_CLOSE_DEBIT") or "0.50")
+# Once a due close's short leg expires within this many weekdays, the close
+# may pay the market's own price above MAX_CLOSE_DEBIT, since an unclosed
+# short can be assigned at expiry. GEHC was held at $0.50 from 2026-10-28
+# until its short expired on 2026-10-30.
+EXPIRY_MARKET_CLOSE_DAYS = int(os.environ.get("EXPIRY_MARKET_CLOSE_DAYS") or "2")
 # Quotes, the submit guard, submission and cancel confirmation add 0.4-1.1 s.
 ORDER_ATTEMPT_OVERHEAD_SECONDS = 1
 UUID_NAMESPACE = uuid.UUID("f8eaa5b8-685f-4d83-9308-b426ad5f95a1")
@@ -1319,6 +1326,11 @@ def report_overdue_exits(overdue):
     append_step_summary("### PAPER position exits\n\n"+f"- Overdue exits: {len(overdue)}"+(f" ({names})" if overdue else "")+"\n")
 
 
+def weekdays_until(day,expiry):
+    """Weekdays after ``day`` through ``expiry``; exchange holidays still count."""
+    return sum(1 for offset in range(1,(expiry-day).days+1) if (day+timedelta(days=offset)).weekday()<5)
+
+
 def close_due_trades(client,reconciliation,run_deadline,market_close=None):
     """Close due positions and return the trades whose close quotes stayed invalid."""
     failures=[]
@@ -1345,7 +1357,9 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
             if state=="MATCHED_SPREAD":
                 method="calendar_spread"
                 prefix=reserve_operation_prefix(tid,"close",method)
-                result=close_calendar_spread_order(trade["Short Symbol"],trade["Long Symbol"],qty,max_close_debit=Decimal(os.environ.get("MAX_CLOSE_DEBIT","0.50")),
+                short_expiry=option_expiration(trade["Short Symbol"])
+                near_expiry=short_expiry is not None and weekdays_until(datetime.now(EASTERN).date(),short_expiry)<=EXPIRY_MARKET_CLOSE_DAYS
+                result=close_calendar_spread_order(trade["Short Symbol"],trade["Long Symbol"],qty,max_close_debit=MAX_CLOSE_DEBIT,pay_market_price=near_expiry,
                   on_terminal=lambda event,tid=tid:record_fill(tid,"close","calendar_spread",event,"scheduled_post_earnings_close"),
                   on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","calendar_spread",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
                   on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","calendar_spread",order,{**context,"submission_only":True}),
@@ -1537,6 +1551,10 @@ def run_trade_workflow():
         raise OperationalFailure("QUOTE_MAX_AGE_SECONDS must be greater than zero and no more than 900")
     if not 0<CLOSE_QUOTE_MAX_AGE_SECONDS<=3600:
         raise OperationalFailure("CLOSE_QUOTE_MAX_AGE_SECONDS must be greater than zero and no more than 3600")
+    if not (MAX_CLOSE_DEBIT.is_finite() and MAX_CLOSE_DEBIT>=0):
+        raise OperationalFailure("MAX_CLOSE_DEBIT must be zero or more")
+    if not 0<=EXPIRY_MARKET_CLOSE_DAYS<=10:
+        raise OperationalFailure("EXPIRY_MARKET_CLOSE_DAYS must be between 0 and 10")
     client,broker_mode=configured_broker_client()
     broker_identity=bind_or_validate_broker_identity(client,broker_mode,allow_bind=True)
     reconciliation=reconcile_broker_state(client,read_only=False,broker_mode=broker_mode,broker_identity=broker_identity)

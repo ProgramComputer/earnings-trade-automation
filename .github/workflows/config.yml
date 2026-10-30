@@ -42,6 +42,8 @@ jobs:
       # Unset repository variables arrive empty, and the code applies its defaults.
       QUOTE_MAX_AGE_SECONDS: ${{ vars.QUOTE_MAX_AGE_SECONDS }}
       CLOSE_QUOTE_MAX_AGE_SECONDS: ${{ vars.CLOSE_QUOTE_MAX_AGE_SECONDS }}
+      MAX_CLOSE_DEBIT: ${{ vars.MAX_CLOSE_DEBIT }}
+      EXPIRY_MARKET_CLOSE_DAYS: ${{ vars.EXPIRY_MARKET_CLOSE_DAYS }}
       OPEN_MAX_DEBIT_SPREAD_FRACTION: ${{ vars.OPEN_MAX_DEBIT_SPREAD_FRACTION }}
       OPEN_MAX_SPREAD_WIDTH_PCT: ${{ vars.OPEN_MAX_SPREAD_WIDTH_PCT }}
       OPEN_CEILING_FOLLOW_PCT: ${{ vars.OPEN_CEILING_FOLLOW_PCT }}

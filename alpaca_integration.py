@@ -379,8 +379,9 @@ def _validated_quote(quote, symbol, max_age_seconds, *, allow_empty_bid=False):
     """Validate one option quote.
 
     ``allow_empty_bid`` accepts a market with no bid at all (zero price and zero
-    size), which is normal for a nearly worthless option. Only a leg the order
-    buys may use it; a leg being sold still needs a real bid.
+    size), which is normal for a nearly worthless option. A leg being sold
+    needs a real bid unless the order may give it up for nothing, as a closing
+    spread does with a worthless long leg.
     """
     if quote is None:
         raise QuoteValidationError(f"Missing quote for {symbol}.")
@@ -443,6 +444,7 @@ def _fetch_spread_quote_snapshot(
     max_age_seconds,
     *,
     allow_empty_short_bid=False,
+    allow_empty_long_bid=False,
     validation_attempts=DEFAULT_QUOTE_FETCH_ATTEMPTS,
     validation_retry_delay_seconds=DEFAULT_QUOTE_RETRY_DELAY_SECONDS,
 ):
@@ -461,7 +463,8 @@ def _fetch_spread_quote_snapshot(
             allow_empty_bid=allow_empty_short_bid,
         )
         long_bid, long_ask = _validated_quote(
-            response.get(long_symbol), long_symbol, max_age_seconds
+            response.get(long_symbol), long_symbol, max_age_seconds,
+            allow_empty_bid=allow_empty_long_bid,
         )
         return SpreadQuoteSnapshot(short_bid, short_ask, long_bid, long_ask)
 
@@ -1026,6 +1029,7 @@ def close_calendar_spread_order(
     client_order_id_prefix,
     max_close_debit=None,
     min_close_credit=None,
+    pay_market_price=False,
     max_attempts=DEFAULT_MAX_ATTEMPTS,
     overall_timeout=DEFAULT_OVERALL_TIMEOUT,
     attempt_timeout=DEFAULT_ATTEMPT_TIMEOUT,
@@ -1042,7 +1046,9 @@ def close_calendar_spread_order(
     positive signed limit allowed, while ``min_close_credit`` becomes a negative
     signed ceiling. Quotes and the net spread are recalculated before every try,
     and the chase keeps offering the market's price until its attempts or time
-    run out; only the hard ceiling stops it early.
+    run out; only the hard ceiling stops it early. With ``pay_market_price``
+    the ceiling rises to each fresh natural price when that is higher, for a
+    short leg about to expire; no attempt pays more than the natural price.
     ``on_terminal`` receives cumulative fill progress and every safely inactive
     attempt; ``on_order_state`` persists terminal state independently of fill
     accounting. ``on_filled`` remains the backward-compatible fill callback alias.
@@ -1085,9 +1091,11 @@ def close_calendar_spread_order(
             stop_reason = "overall_deadline_reached"
             break
 
-        # Closing buys the short leg back, so it may have no bid once worthless.
+        # Either leg may have no bid once worthless: the short is bought back,
+        # and a worthless long is given up with the spread.
         quotes = _fetch_spread_quote_snapshot(
-            short_symbol, long_symbol, quote_max_age_seconds, allow_empty_short_bid=True
+            short_symbol, long_symbol, quote_max_age_seconds,
+            allow_empty_short_bid=True, allow_empty_long_bid=True,
         )
         signed_bid = quotes.closing_signed_bid
         signed_ask = quotes.closing_signed_ask
@@ -1102,17 +1110,18 @@ def close_calendar_spread_order(
             else midpoint if previous_limit is None
             else previous_limit + _chase_step(signed_bid, signed_ask)
         )
-        natural_upper_bound = min(signed_ask, hard_ceiling)
+        ceiling = max(hard_ceiling, signed_ask) if pay_market_price else hard_ceiling
+        natural_upper_bound = min(signed_ask, ceiling)
         lower_reference = min(signed_bid, natural_upper_bound)
         attempt_limit = _max_price_cent(
             max(lower_reference, min(proposed, natural_upper_bound))
         )
-        if attempt_limit > hard_ceiling:
+        if attempt_limit > ceiling:
             raise OrderExecutionError("Closing price calculation exceeded its hard signed ceiling")
         # A due position must still close, so a price already tried is offered
         # again while it is the market's own price; only the hard ceiling ends
         # the chase early.
-        if attempt_limit in attempted_prices and attempt_limit >= hard_ceiling:
+        if attempt_limit in attempted_prices and attempt_limit >= hard_ceiling and not pay_market_price:
             stop_reason = "hard_price_limit_reached"
             break
 
@@ -1169,7 +1178,7 @@ def close_calendar_spread_order(
             f"Submitted {_client_mode_label(client)} spread close attempt "
             f"{attempt_number}/{max_attempts}: "
             f"order_id={submitted.id}, qty={remaining_qty}, signed_limit={attempt_limit}, "
-            f"signed_bid={signed_bid}, signed_ask={signed_ask}, hard_ceiling={hard_ceiling}."
+            f"signed_bid={signed_bid}, signed_ask={signed_ask}, hard_ceiling={ceiling}."
         )
         _notify_submitted_order(
             on_submitted,
@@ -1214,10 +1223,10 @@ def close_calendar_spread_order(
                 raise OrderExecutionError(
                     f"Order {result.order_id} filled without an average fill price"
                 )
-            if result.average_fill_price > hard_ceiling:
+            if result.average_fill_price > ceiling:
                 raise OrderExecutionError(
                     f"Order {result.order_id} filled beyond hard signed close ceiling: "
-                    f"{result.average_fill_price} > {hard_ceiling}"
+                    f"{result.average_fill_price} > {ceiling}"
                 )
             if result.average_fill_price > attempt_limit:
                 raise OrderExecutionError(
