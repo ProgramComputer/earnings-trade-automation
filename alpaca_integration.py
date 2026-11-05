@@ -1763,6 +1763,50 @@ def get_single_option_quotes(
     return float(quote.bid), float(quote.ask)
 
 
+def close_assigned_stock_order(client, symbol, quantity, *, client_order_id_prefix,
+                               before_submit, on_submitted, on_terminal,
+                               attempt_timeout=10, cancel_timeout=30):
+    """One PAPER-only limit buy to cover shares backed by assignment receipts.
+
+    Keep the long calls until the shares are fully covered. Partial share fills
+    are persisted and the next Actions run covers only the remaining shares.
+    """
+    paper = _require_explicit_trading_mode()
+    endpoint = getattr(client, "_base_url", None)
+    if (paper is not True or _client_mode_label(client) != "PAPER" or not callable(before_submit)
+            or str(getattr(endpoint,"value",endpoint)).rstrip("/")!="https://paper-api.alpaca.markets"):
+        raise PaperModeRequiredError("Assignment recovery requires a guarded PAPER client")
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestQuoteRequest
+    requested = _int_quantity(quantity, "assigned shares")
+    if requested <= 0:
+        raise ValueError("Assigned share quantity must be positive")
+    data = StockHistoricalDataClient(os.environ.get("APCA_API_KEY_ID"), os.environ.get("APCA_API_SECRET_KEY"))
+    quotes = data.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+    _, ask = _validated_quote(quotes.get(symbol), symbol, 30)
+    limit = _max_price_cent(ask)
+    cid = _client_order_id(client_order_id_prefix, "stock-cover", 1)
+    context = {"operation": "cover_assigned_stock", "symbol": symbol,
+               "quantity": requested, "limit_price": limit, "client_order_id": cid}
+    declined = _run_before_submit(before_submit, client, context)
+    if declined:
+        return _execution_result("cover_assigned_stock", symbol, requested, (), declined)
+    # BUY_TO_CLOSE prevents this recovery from deliberately opening a long stock position.
+    request = LimitOrderRequest(symbol=symbol, qty=requested, side=OrderSide.BUY,
+                                position_intent=PositionIntent.BUY_TO_CLOSE,
+                                time_in_force=TimeInForce.DAY, order_class=OrderClass.SIMPLE,
+                                limit_price=float(limit), client_order_id=cid)
+    submitted = _submit_order_idempotently(client, request, cid)
+    _notify_submitted_order(on_submitted, on_terminal, on_terminal, None, client,
+                            submitted, context, requested, cancel_timeout)
+    result = wait_for_fill(client, submitted.id, timeout=attempt_timeout, interval=1,
+                           cancel_timeout=cancel_timeout, expected_qty=requested,
+                           progress_callback=on_terminal, terminal_state_callback=on_terminal)
+    if result.filled_qty and (result.average_fill_price is None or result.average_fill_price > limit):
+        raise OrderExecutionError("Assignment cover fill exceeded its submitted buy limit")
+    return _execution_result("cover_assigned_stock", symbol, requested, (result,), result.stop_reason)
+
+
 def close_single_option_leg_order(
     symbol: str,
     quantity: int,

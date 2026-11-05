@@ -283,7 +283,7 @@ class EntryPricingTests(unittest.TestCase):
             stack.enter_context(patch.object(alpaca_integration, "_fetch_spread_quote_snapshot", fetch))
             stack.enter_context(patch.object(alpaca_integration, "_submit_order_idempotently", Mock(side_effect=submit)))
             for name, value in (
-                ("reconcile_broker_state", Mock()),
+                ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                 ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
                 ("exposure_cents", Mock(return_value=0)),
                 *settings.items(),
@@ -367,7 +367,7 @@ class EntryPricingTests(unittest.TestCase):
                 now = datetime.now(timezone.utc)
                 client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
                 for name, value in (
-                    ("reconcile_broker_state", Mock()),
+                    ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                     ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
                     ("exposure_cents", Mock(return_value=0)),
                 ):
@@ -389,7 +389,7 @@ class EntryPricingTests(unittest.TestCase):
                 now = datetime.now(timezone.utc)
                 client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
                 for name, value in (
-                    ("reconcile_broker_state", Mock()),
+                    ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                     ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
                     ("exposure_cents", Mock(return_value=0)),
                 ):
@@ -836,7 +836,7 @@ class TimingRefusalTests(unittest.TestCase):
             quotes = alpaca_integration.SpreadQuoteSnapshot(Decimal("0.50"), Decimal("0.60"), Decimal("0.80"), Decimal("1.00"))
             submitted = chase_patches(stack, client, quotes)
             for name, value in (
-                ("reconcile_broker_state", Mock()),
+                ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                 ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
                 ("exposure_cents", Mock(return_value=0)),
             ):
@@ -882,7 +882,7 @@ class TimingRefusalTests(unittest.TestCase):
                 ("is_time_to_close", Mock(return_value=True)),
                 ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
                 ("reserve_operation_prefix", Mock(return_value="prefix")),
-                ("reconcile_broker_state", Mock()),
+                ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                 ("finalize_execution", Mock()),
             ):
                 stack.enter_context(patch.object(trade_workflow, name, value))
@@ -1127,7 +1127,7 @@ class ExitChaseTests(unittest.TestCase):
                 ("get_open_trades", Mock(return_value=[trade])),
                 ("is_time_to_close", Mock(return_value=True)),
                 ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
-                ("reconcile_broker_state", Mock()),
+                ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                 ("reserve_operation_prefix", Mock(return_value="prefix")),
                 ("finalize_execution", Mock()),
                 ("close_calendar_spread_order", close),
@@ -1188,7 +1188,7 @@ class CloseQuoteAgeTests(unittest.TestCase):
                 ("get_open_trades", Mock(return_value=[trade])),
                 ("is_time_to_close", Mock(return_value=True)),
                 ("account_snapshot", Mock(return_value=(Decimal("100000"), Decimal("100000")))),
-                ("reconcile_broker_state", Mock()),
+                ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
                 ("reserve_operation_prefix", Mock(return_value="prefix")),
                 ("finalize_execution", Mock()),
                 ("record_close_quote_failure", Mock(side_effect=lambda _tid, error: f"CLOSE_QUOTE_VALIDATION_FAILED: {error}")),
@@ -1297,7 +1297,7 @@ class ExposureCapHeadroomTests(unittest.TestCase):
             for name, value in (
                 ("account_snapshot", account),
                 ("exposure_cents", Mock(return_value=self.EXISTING)),
-                ("reconcile_broker_state", Mock()),
+                ("reconcile_broker_state", Mock(return_value={"resolutions": {}})),
             ):
                 stack.enter_context(patch.object(trade_workflow, name, value))
             stack.enter_context(redirect_stdout(io.StringIO()))

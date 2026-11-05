@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import yfinance as yf
+from assignment_recovery import AssignmentEvidenceError, fetch_activities, match_call_assignment
 from dotenv import load_dotenv
 from alpaca.trading.enums import PositionIntent
 
@@ -25,6 +26,7 @@ from automation import compute_recommendation, get_todays_earnings, get_tomorrow
 from alpaca_integration import (
     DEFAULT_QUOTE_MAX_AGE_SECONDS, QuoteValidationError, SubmissionTimingRefusal,
     close_calendar_spread_order, close_single_option_leg_order,
+    close_assigned_stock_order,
     get_alpaca_option_chain, get_spread_quotes, init_alpaca_client,
     place_calendar_spread_order, select_expiries_and_strike_alpaca,
 )
@@ -281,6 +283,13 @@ def init_db():
         for table in ("broker_orders", "fills"):
             if "commission_status" not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN commission_status TEXT")
+        conn.execute('''CREATE TABLE IF NOT EXISTS paper_assignments(
+          trade_id TEXT PRIMARY KEY,assigned_contracts INTEGER NOT NULL,stock_quantity INTEGER NOT NULL,
+          proceeds_cents INTEGER NOT NULL,assignment_date TEXT NOT NULL,activity_ids TEXT NOT NULL,
+          FOREIGN KEY(trade_id) REFERENCES trades(trade_id))''')
+        for column in ("settlement_cash_flow_cents", "settlement_fees_cents"):
+            if column not in {row[1] for row in conn.execute("PRAGMA table_info(fills)")}:
+                conn.execute(f"ALTER TABLE fills ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         # Trades synced as one row per fill are re-sent once as one row per
         # trade, which lets the Sheet fold each entry/exit pair into one row.
         trade_rows_migration="sheet_trade_rows_v1"
@@ -464,7 +473,7 @@ def stable_trade_id(ticker, earnings_date, when, short_symbol=None, long_symbol=
 
 
 def client_prefix(phase, trade_id, generation, method="calendar_spread"):
-    code = "o" if phase == "open" else ("c" if method == "calendar_spread" else "s")
+    code = "a" if phase == "assignment_cover" else "o" if phase == "open" else ("c" if method == "calendar_spread" else "s")
     return f"eta-{code}-{uuid.UUID(trade_id).hex[:20]}-{generation:04d}"
 
 
@@ -761,7 +770,8 @@ def record_fill(trade_id, phase, method, order, close_reason=None):
         validate_order_identity(conn,oid,trade_id,phase,method,client_id)
         previous = conn.execute("SELECT * FROM broker_orders WHERE order_id=?",(oid,)).fetchone()
         accounted=conn.execute('''SELECT COALESCE(MAX(cumulative_order_filled_quantity),0) AS quantity,
-          COALESCE(SUM(cash_flow_cents),0) AS cashflow,COALESCE(SUM(fees_cents),0) AS fees
+          COALESCE(SUM(cash_flow_cents-settlement_cash_flow_cents),0) AS cashflow,
+          COALESCE(SUM(fees_cents-settlement_fees_cents),0) AS fees
           FROM fills WHERE broker_order_id=? AND phase=?''',(oid,phase)).fetchone()
         old_qty=int(accounted["quantity"] or 0)
         old_cf=int(accounted["cashflow"] or 0)
@@ -787,6 +797,25 @@ def record_fill(trade_id, phase, method, order, close_reason=None):
             if cumulative_cf!=old_cf:
                 raise ReconciliationFailure(f"Broker order {oid} changed its accounted cumulative fill price")
             return None
+        settlement_cf=settlement_fees=0
+        if phase=="close" and method=="single_long_sell":
+            assignment=conn.execute("SELECT * FROM paper_assignments WHERE trade_id=?",(trade_id,)).fetchone()
+            if assignment:
+                cover=assignment_cover_totals(conn,trade_id)
+                if cover["quantity"]!=assignment["stock_quantity"]:
+                    raise ReconciliationFailure("Assigned shares must be fully covered before selling long calls")
+                total_cf=assignment["proceeds_cents"]+cover["cashflow"]
+                allocated=conn.execute('''SELECT COALESCE(SUM(settlement_cash_flow_cents),0),
+                  COALESCE(SUM(settlement_fees_cents),0) FROM fills WHERE trade_id=?''',(trade_id,)).fetchone()
+                remaining=int(trade["remaining_quantity"])
+                if delta_qty==remaining:
+                    settlement_cf,settlement_fees=total_cf-allocated[0],cover["fees"]-allocated[1]
+                else:
+                    settlement_cf=int((Decimal(total_cf)*delta_qty/assignment["assigned_contracts"]).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+                    settlement_fees=int((Decimal(cover["fees"])*delta_qty/assignment["assigned_contracts"]).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+                delta_cf+=settlement_cf; delta_fees+=settlement_fees
+                # OPASN/OPTRD do not confirm all assignment-related charges.
+                commission_status="unavailable"
         if phase == "open":
             available=max(0,int(trade["ordered_quantity"] or 0)-int(trade["filled_quantity"] or 0))
             if delta_qty>available:
@@ -817,6 +846,9 @@ def record_fill(trade_id, phase, method, order, close_reason=None):
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')''',
           (fill_id,trade_id,trade["parent_trade_id"] or trade_id,oid,activity,phase,method,cumulative,delta_qty,str(price),
            delta_cf,delta_fees,alloc_cf,alloc_fees,realized,commission_status,occurred,close_reason))
+        if settlement_cf or settlement_fees:
+            conn.execute("UPDATE fills SET settlement_cash_flow_cents=?,settlement_fees_cents=? WHERE fill_id=?",
+                         (settlement_cf,settlement_fees,fill_id))
         if phase=="open":
             new_filled=int(trade["filled_quantity"] or 0)+delta_qty
             new_remaining=int(trade["remaining_quantity"] or 0)+delta_qty
@@ -975,7 +1007,9 @@ def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_deb
         # with no live order. Every other refusal still fails the run.
         if deadline is not None and time_module.monotonic()+headroom >= deadline:
             raise SubmissionWindowClosed("Insufficient run time remains to submit and cancel-confirm an order safely","order_time_budget_reached")
-        reconcile_broker_state(client,read_only=True)
+        current=reconcile_broker_state(client,read_only=True)
+        if opening and any(state.startswith("ASSIGNED_") for state in current["resolutions"].values()):
+            raise ReconciliationFailure("New entries are paused until PAPER assignment recovery finishes")
         try: clock=client.get_clock()
         except Exception as exc: raise OperationalFailure(f"Unable to refresh broker market clock: {redact(exc)}") from exc
         is_open=getattr(clock,"is_open",None)
@@ -989,7 +1023,8 @@ def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_deb
             raise SubmissionWindowClosed("Order submission cutoff reached before market close","close_cutoff_reached")
         equity,buying=account_snapshot(client)
         price=dec(context.get("limit_price",0)); quantity=int(context.get("quantity",0))
-        required=(abs(price) if opening else (max(price,Decimal(0)) if close_requires_debit else Decimal(0)))*quantity*100
+        multiplier=1 if context.get("operation")=="cover_assigned_stock" else 100
+        required=(abs(price) if opening else (max(price,Decimal(0)) if close_requires_debit else Decimal(0)))*quantity*multiplier
         required_cents=dollars_to_cents(required)
         if required>buying:
             raise OperationalFailure(f"Insufficient configured-account buying power for {context.get('operation','order')}: required ${required:.2f}")
@@ -1103,6 +1138,8 @@ def known_order(conn,order):
       FROM trades WHERE ? LIKE COALESCE(open_client_order_prefix,'!')||'%'
          OR ? LIKE COALESCE(close_client_order_prefix,'!')||'%' LIMIT 1''',(cid,cid,cid)).fetchone()
     if by_prefix:
+        if cid.startswith("eta-a-"):
+            return by_prefix["trade_id"],"assignment_cover","assignment_stock_buy"
         if "-o-" in cid or "-c-" in cid:
             method="calendar_spread"
         else:
@@ -1126,6 +1163,16 @@ def validate_order_link(conn,order,link):
     tif=enum_text(getattr(order,"time_in_force",""))
     order_type=enum_text(getattr(order,"type","") or getattr(order,"order_type",""))
     if tif!="day" or order_type!="limit": return False,"order_type_or_tif_mismatch"
+    if phase=="assignment_cover":
+        receipt=conn.execute("SELECT stock_quantity FROM paper_assignments WHERE trade_id=?",(trade_id,)).fetchone()
+        identity=conn.execute("SELECT broker_mode FROM broker_identity WHERE singleton_id=1").fetchone()
+        if (not receipt or not identity or identity[0]!="PAPER" or method!="assignment_stock_buy"
+                or symbols!={str(trade["Ticker"]).upper()} or order_class not in {"simple",""}
+                or enum_text(getattr(order,"side",""))!="buy"
+                or enum_text(getattr(order,"position_intent",""))!="buy_to_close"
+                or not 0<dec(getattr(order,"qty",0))<=receipt[0]):
+            return False,"assignment_cover_identity_mismatch"
+        return True,"matched"
     if method=="calendar_spread":
         if order_class!="mleg" or not expected.issubset(symbols): return False,"spread_class_or_symbols_mismatch"
         expected_legs={
@@ -1182,6 +1229,106 @@ def broker_order_summary(order):
     }
 
 
+def assignment_cover_totals(conn, trade_id):
+    return conn.execute('''SELECT COALESCE(SUM(filled_quantity),0) AS quantity,
+      COALESCE(SUM(filled_cash_flow_cents),0) AS cashflow,COALESCE(SUM(fees_cents),0) AS fees,
+      COALESCE(MAX(CASE WHEN filled_quantity>0 AND commission_status='unavailable' THEN 1 ELSE 0 END),0) AS fees_unknown
+      FROM broker_orders WHERE trade_id=? AND phase='assignment_cover' ''',(trade_id,)).fetchone()
+
+
+def refresh_trade_sheet(conn, trade_id):
+    # A settlement changes the existing trade, not its contract fill quantity.
+    row=conn.execute("SELECT fill_id,phase FROM fills WHERE trade_id=? ORDER BY occurred_at DESC LIMIT 1",(trade_id,)).fetchone()
+    if row:
+        enqueue_fill(conn,trade_id,row["fill_id"],row["phase"])
+        conn.execute("UPDATE sheet_outbox SET state='pending',last_error=NULL,updated_at=? WHERE event_id=?",(stamp(),row["fill_id"]))
+
+
+def record_assignment_cover(trade_id, order):
+    """Account for actual cumulative share fills, independently of option units."""
+    order=getattr(order,"raw_order",None) or order
+    oid=order_id(order)
+    if not oid: raise ReconciliationFailure("Assignment cover has no broker order ID")
+    qty,filled,canceled,remaining=quantities(order)
+    if any(dec(getattr(order,name,0) or 0)!=value for name,value in (("qty",qty),("filled_qty",filled))):
+        raise ReconciliationFailure("Assignment cover has a fractional share quantity")
+    raw_price=getattr(order,"average_fill_price",None) or getattr(order,"filled_avg_price",None)
+    if filled and raw_price in (None,""):
+        raise ReconciliationFailure("Assignment cover fill has no broker price")
+    price=dec(raw_price)
+    if not price.is_finite() or (filled and price<=0):
+        raise ReconciliationFailure("Assignment cover fill has an invalid broker price")
+    cashflow=-dollars_to_cents(price*filled)
+    commission=getattr(order,"commission_amount",None)
+    if commission is None: commission=getattr(order,"commission",None)
+    fees=dollars_to_cents(commission or 0)
+    with db(write=True) as conn:
+        receipt=conn.execute("SELECT * FROM paper_assignments WHERE trade_id=?",(trade_id,)).fetchone()
+        identity=conn.execute("SELECT broker_mode FROM broker_identity WHERE singleton_id=1").fetchone()
+        if not receipt or not identity or identity[0]!="PAPER":
+            raise ReconciliationFailure("Assignment covers require verified PAPER settlement receipts")
+        valid,reason=validate_order_link(conn,order,(trade_id,"assignment_cover","assignment_stock_buy"))
+        if not valid or fees<0:
+            raise ReconciliationFailure(f"Assignment cover order is not valid: {reason}")
+        previous=conn.execute("SELECT * FROM broker_orders WHERE order_id=?",(oid,)).fetchone()
+        old_qty=int(previous["filled_quantity"] or 0) if previous else 0
+        old_cf=int(previous["filled_cash_flow_cents"] or 0) if previous else 0
+        if filled<old_qty or (filled==old_qty and old_cf and old_cf!=cashflow):
+            raise ReconciliationFailure("Assignment cover cumulative fill changed incompatibly")
+        totals=assignment_cover_totals(conn,trade_id)
+        if not 0<qty<=receipt["stock_quantity"] or totals["quantity"]-old_qty+filled>receipt["stock_quantity"]:
+            raise ReconciliationFailure("Assignment cover would exceed the delivered shares")
+    upsert_submitted_order(trade_id,"assignment_cover","assignment_stock_buy",order)
+    with db(write=True) as conn:
+        conn.execute('''UPDATE broker_orders SET filled_quantity=?,filled_cash_flow_cents=?,fees_cents=?,
+          filled_avg_price=?,commission_status=?,updated_at=? WHERE order_id=?''',
+          (filled,cashflow,fees,str(price),"unavailable" if commission is None else "confirmed",stamp(),oid))
+        if filled>old_qty:
+            conn.execute("UPDATE trades SET lifecycle_status='ASSIGNMENT_RECOVERY',updated_at=? WHERE trade_id=?",(stamp(),trade_id))
+            refresh_trade_sheet(conn,trade_id)
+
+
+def paper_assignment(client, trade, equities, options, identity, read_only):
+    """Match the position to receipts before treating any stock as owned by us."""
+    with db(read_only=read_only) as conn:
+        exists=conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_assignments'").fetchone()
+        stored=conn.execute("SELECT * FROM paper_assignments WHERE trade_id=?",(trade["trade_id"],)).fetchone() if exists else None
+        other=conn.execute('''SELECT COUNT(*) FROM trades WHERE "Ticker"=? AND remaining_quantity>0 AND trade_id!=?''',
+                           (trade["Ticker"],trade["trade_id"])).fetchone()[0]
+    if other:
+        raise ReconciliationFailure("Assignment stock cannot be attributed to more than one open trade")
+    if stored:
+        receipt=dict(stored)
+    else:
+        if options.get(trade["Short Symbol"],Decimal(0))!=0:
+            raise ReconciliationFailure("Partial assignment recovery requires review")
+        try:
+            activities=fetch_activities(client,(date.fromisoformat(trade["Open Date"])-timedelta(days=1)).isoformat(),identity["account_fingerprint"])
+            receipt=match_call_assignment(trade,activities,client.get_option_contract(trade["Short Symbol"]),client.get_option_contract(trade["Long Symbol"]))
+        except Exception as exc:
+            raise ReconciliationFailure(f"PAPER assignment evidence could not be verified: {redact(exc)}") from exc
+    with db(read_only=read_only) as conn:
+        totals=assignment_cover_totals(conn,trade["trade_id"])
+    stock_expected=-receipt["stock_quantity"]+int(totals["quantity"])
+    if (stock_expected>0 or equities.get(trade["Ticker"],Decimal(0))!=stock_expected
+            or options.get(trade["Short Symbol"],Decimal(0))!=0
+            or options.get(trade["Long Symbol"],Decimal(0))!=int(trade["remaining_quantity"])):
+        raise ReconciliationFailure("PAPER assignment receipts, cover fills and current positions do not balance")
+    if not stored and not read_only:
+        with db(write=True) as conn:
+            claimed=set()
+            for row in conn.execute("SELECT activity_ids FROM paper_assignments"):
+                claimed.update(json.loads(row[0]))
+            if claimed.intersection(json.loads(receipt["activity_ids"])):
+                raise ReconciliationFailure("Assignment activities are already attributed to another trade")
+            conn.execute('''INSERT INTO paper_assignments VALUES(?,?,?,?,?,?)''',
+                         tuple(receipt[key] for key in ("trade_id","assigned_contracts","stock_quantity","proceeds_cents","assignment_date","activity_ids")))
+            conn.execute("UPDATE trades SET lifecycle_status='ASSIGNMENT_RECOVERY',updated_at=? WHERE trade_id=?",(stamp(),trade["trade_id"]))
+            refresh_trade_sheet(conn,trade["trade_id"])
+    print(f"Verified PAPER call assignment: {trade['Ticker']} contracts={receipt['assigned_contracts']} delivered_shares={receipt['stock_quantity']} date={receipt['assignment_date']} receipts={len(json.loads(receipt['activity_ids']))}")
+    return "ASSIGNED_SHORT_STOCK" if stock_expected<0 else "ASSIGNED_STOCK_COVERED_LONG_REMAINS"
+
+
 def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identity=None):
     _,configured_name,_=configured_mode()
     if broker_mode is not None and broker_mode!=configured_name:
@@ -1210,6 +1357,9 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
         for order,link,valid,_ in linked:
             if not link or not valid: continue
             trade_id,phase,method=link
+            if phase=="assignment_cover":
+                record_assignment_cover(trade_id,order)
+                continue
             if int(dec(getattr(order,"filled_qty",0) or 0))>0:
                 if method=="single_leg":
                     intent=enum_text(getattr(order,"position_intent",""))
@@ -1224,12 +1374,21 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
         for order in orders:
             link=known_order(conn,order); valid,reason=validate_order_link(conn,order,link)
             links[order_id(order)]=(link,valid,reason)
-    discrepancies=[]; resolutions={}; expected=set()
+    discrepancies=[]; resolutions={}; expected=set(); assigned_equities=set()
     for trade in trades:
         tid=trade["trade_id"]; qty=Decimal(int(trade["remaining_quantity"] or 0))
         short=str(trade["Short Symbol"] or "").upper(); long=str(trade["Long Symbol"] or "").upper(); ticker=str(trade["Ticker"] or "").upper()
         expected.update({short,long}); long_qty=options.get(long,Decimal(0)); short_qty=options.get(short,Decimal(0))
-        if equities.get(ticker,Decimal(0))!=0:
+        with db(read_only=read_only) as conn:
+            assignment_table=conn.execute("SELECT 1 FROM sqlite_master WHERE name='paper_assignments'").fetchone()
+            assigned=bool(assignment_table and conn.execute("SELECT 1 FROM paper_assignments WHERE trade_id=?",(tid,)).fetchone())
+        if broker_mode=="PAPER" and (assigned or equities.get(ticker,Decimal(0))!=0):
+            try:
+                resolutions[tid]=paper_assignment(client,trade,equities,options,broker_identity,read_only)
+                assigned_equities.add(ticker)
+            except ReconciliationFailure as exc:
+                discrepancies.append({"type":"unverified_assignment","trade_id":tid,"ticker":ticker,"reason":str(exc)})
+        elif equities.get(ticker,Decimal(0))!=0:
             discrepancies.append({"type":"possible_assignment_or_stock_exposure","trade_id":tid,"ticker":ticker,"quantity":str(equities[ticker])})
         elif long_qty==qty and short_qty==-qty: resolutions[tid]="MATCHED_SPREAD"
         elif long_qty==qty and short_qty==0 and confirmed_expired(client,short): resolutions[tid]="SHORT_EXPIRED_LONG_REMAINS"
@@ -1239,7 +1398,7 @@ def reconcile_broker_state(client,read_only=False,broker_mode=None,broker_identi
     for symbol,qty in options.items():
         if qty and symbol not in expected: discrepancies.append({"type":"unmatched_broker_option_position","symbol":symbol,"quantity":str(qty)})
     for symbol,qty in equities.items():
-        if qty: discrepancies.append({"type":"unmatched_or_assignment_equity_position","symbol":symbol,"quantity":str(qty)})
+        if qty and symbol not in assigned_equities: discrepancies.append({"type":"unmatched_or_assignment_equity_position","symbol":symbol,"quantity":str(qty)})
     for order in orders:
         status=enum_text(getattr(order,"status",""))
         link,valid,reason=links.get(order_id(order),(None,False,"unlinked"))
@@ -1354,6 +1513,26 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
         operation_deadline=min(time_module.monotonic()+CLOSE_ORDER_TIMING["overall_timeout"],run_deadline)
         common={"max_attempts":chase_attempts(CLOSE_ORDER_TIMING),**CLOSE_ORDER_TIMING,"quote_max_age_seconds":CLOSE_QUOTE_MAX_AGE_SECONDS}
         try:
+            if state=="ASSIGNED_SHORT_STOCK":
+                with db() as conn:
+                    receipt=conn.execute("SELECT * FROM paper_assignments WHERE trade_id=?",(tid,)).fetchone()
+                    covered=assignment_cover_totals(conn,tid)["quantity"]
+                shares=receipt["stock_quantity"]-covered
+                prefix=reserve_operation_prefix(tid,"assignment_cover","assignment_stock_buy")
+                result=close_assigned_stock_order(client,trade["Ticker"],shares,client_order_id_prefix=prefix,
+                    before_submit=before_submit_guard(deadline=operation_deadline,order_timing=common),
+                    on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"assignment_cover","assignment_stock_buy",order,{**context,"submission_only":True}),
+                    on_terminal=lambda event,tid=tid:record_assignment_cover(tid,event),
+                    attempt_timeout=common["attempt_timeout"],cancel_timeout=common["cancel_timeout"])
+                finalize_execution(tid,result)
+                print(f"PAPER assignment share cover trade={tid} filled={result.filled_qty} remaining={result.remaining_qty}")
+                if result.remaining_qty:
+                    print(f"::warning title=Due close deferred::Assignment shares remain for trade={tid}; long calls are retained.")
+                    continue
+                current=reconcile_broker_state(client,read_only=True)
+                state=current["resolutions"].get(tid)
+                if state!="ASSIGNED_STOCK_COVERED_LONG_REMAINS":
+                    raise ReconciliationFailure("Covered assignment did not reconcile before the long-call sale")
             if state=="MATCHED_SPREAD":
                 method="calendar_spread"
                 prefix=reserve_operation_prefix(tid,"close",method)
@@ -1365,11 +1544,12 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
                   on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","calendar_spread",order,{**context,"submission_only":True}),
                   before_submit=before_submit_guard(close_requires_debit=True,deadline=operation_deadline,order_timing=common),
                   client_order_id_prefix=prefix,**common)
-            elif state=="SHORT_EXPIRED_LONG_REMAINS":
+            elif state in {"SHORT_EXPIRED_LONG_REMAINS","ASSIGNED_STOCK_COVERED_LONG_REMAINS"}:
                 method="single_long_sell"
                 prefix=reserve_operation_prefix(tid,"close",method)
                 result=close_single_option_leg_order(trade["Long Symbol"],qty,PositionIntent.SELL_TO_CLOSE,min_sell_price=Decimal(os.environ.get("MIN_LONG_LEG_CLOSE_PRICE","0.01")),
-                  on_terminal=lambda event,tid=tid:record_fill(tid,"close","single_long_sell",event,"confirmed_short_expiry_long_leg_sale"),
+                    on_terminal=lambda event,tid=tid,state=state:record_fill(tid,"close","single_long_sell",event,
+                        "confirmed_assignment_stock_cover_long_sale" if state=="ASSIGNED_STOCK_COVERED_LONG_REMAINS" else "confirmed_short_expiry_long_leg_sale"),
                   on_order_state=lambda event,tid=tid:persist_unpriced_order_state(tid,"close","single_long_sell",event,str(getattr(event,"stop_reason","") or "terminal_order_state")),
                   on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"close","single_long_sell",order,{**context,"submission_only":True}),
                   before_submit=before_submit_guard(close_requires_debit=False,deadline=operation_deadline,order_timing=common),
@@ -1575,6 +1755,12 @@ def run_trade_workflow():
 
 
 def open_new_positions(client,clock,run_deadline):
+    with db() as conn:
+        table=conn.execute("SELECT 1 FROM sqlite_master WHERE name='paper_assignments'").fetchone()
+        assigned=table and conn.execute('''SELECT 1 FROM paper_assignments a JOIN trades t ON t.trade_id=a.trade_id
+          WHERE t.remaining_quantity>0 LIMIT 1''').fetchone()
+    if assigned:
+        print("PAPER assignment recovery remains open; new entries are paused."); return
     now=datetime.now(EASTERN)
     if now.time()<time(12):
         print("Morning position-management run complete; new openings skipped."); return

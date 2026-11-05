@@ -137,6 +137,8 @@ The included GitHub Actions workflow is explicitly configured for PAPER trading.
 - **Open Trades**: Places calendar spread trades at the correct time (BMO/AMC logic).
 - **Track & Close**: Closes each position from 9:40 ET in the session after entry. A due position a run leaves open raises a "Due close deferred" warning and counts in the summary's "Overdue exits"; the next run retries it. Optional Sheet updates are delivered from the SQLite outbox.
 
+PAPER assignment recovery requires Alpaca's executed `OPASN` and matching `OPTRD` records, standard 100-share calls, and matching broker positions. Actions covers the assigned short shares with a limit order before selling the remaining long calls. Partial covers retain the calls for the next run; new entries pause until recovery finishes. Assignment proceeds, share-cover costs and the long-call sale are accounted for in the original trade. Unverified assignments, partial assignments and adjusted contracts stay blocked. The separate PAPER reconciliation check reads broker records on code pushes without changing the ledger or placing orders.
+
 
 
 ## Disclaimer
