@@ -20,6 +20,7 @@ import requests
 import yfinance as yf
 from assignment_recovery import AssignmentEvidenceError, fetch_activities, match_call_assignment
 from dotenv import load_dotenv
+from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import PositionIntent
 
 from automation import compute_recommendation, get_todays_earnings, get_tomorrows_earnings
@@ -116,6 +117,10 @@ class ReconciliationFailure(OperationalFailure):
 
 class SubmissionWindowClosed(OperationalFailure, SubmissionTimingRefusal):
     """Only timing stops the next order, so the chase ends and the run goes on."""
+
+
+class InsufficientBuyingPower(OperationalFailure):
+    """The account cannot pay for this order; a due close waits for the end of the run."""
 
 
 class RunTimeBudgetReached(OperationalFailure):
@@ -1023,11 +1028,10 @@ def before_submit_guard(allocation_cents=0, *, opening=False, close_requires_deb
             raise SubmissionWindowClosed("Order submission cutoff reached before market close","close_cutoff_reached")
         equity,buying=account_snapshot(client)
         price=dec(context.get("limit_price",0)); quantity=int(context.get("quantity",0))
-        multiplier=1 if context.get("operation")=="cover_assigned_stock" else 100
-        required=(abs(price) if opening else (max(price,Decimal(0)) if close_requires_debit else Decimal(0)))*quantity*multiplier
+        required=(abs(price) if opening else (max(price,Decimal(0)) if close_requires_debit else Decimal(0)))*quantity*100
         required_cents=dollars_to_cents(required)
         if required>buying:
-            raise OperationalFailure(f"Insufficient configured-account buying power for {context.get('operation','order')}: required ${required:.2f}")
+            raise InsufficientBuyingPower(f"Insufficient configured-account buying power for {context.get('operation','order')}: required ${required:.2f}")
         if opening:
             if allocation_cents and required_cents>allocation_cents:
                 raise OperationalFailure("Order debit exceeds the reserved per-position allocation")
@@ -1491,7 +1495,7 @@ def weekdays_until(day,expiry):
 
 
 def close_due_trades(client,reconciliation,run_deadline,market_close=None):
-    """Close due positions and return the trades whose close quotes stayed invalid."""
+    """Close due positions and return the ones that stayed open on bad quotes or a refusal."""
     failures=[]
     due=[]
     for trade in get_open_trades():
@@ -1519,8 +1523,10 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
                     covered=assignment_cover_totals(conn,tid)["quantity"]
                 shares=receipt["stock_quantity"]-covered
                 prefix=reserve_operation_prefix(tid,"assignment_cover","assignment_stock_buy")
+                # Buying back short shares reduces risk, and the sale at assignment
+                # already paid for them, so only Alpaca decides whether it can go.
                 result=close_assigned_stock_order(client,trade["Ticker"],shares,client_order_id_prefix=prefix,
-                    before_submit=before_submit_guard(deadline=operation_deadline,order_timing=common),
+                    before_submit=before_submit_guard(close_requires_debit=False,deadline=operation_deadline,order_timing=common),
                     on_submitted=lambda order,context,tid=tid:upsert_submitted_order(tid,"assignment_cover","assignment_stock_buy",order,{**context,"submission_only":True}),
                     on_terminal=lambda event,tid=tid:record_assignment_cover(tid,event),
                     attempt_timeout=common["attempt_timeout"],cancel_timeout=common["cancel_timeout"])
@@ -1559,6 +1565,14 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
             status=record_close_quote_failure(tid,exc)
             failures.append(f"trade={tid} {status}")
             print(f"Close unresolved after bounded quote retries: trade={tid} {status}",file=sys.stderr)
+            continue
+        except (InsufficientBuyingPower,APIError) as exc:
+            # One close the account can't pay for, or that Alpaca rejects, must
+            # not block the others. Neither leaves a live order, and the run
+            # still fails once they have been tried.
+            detail=" ".join(redact(exc).splitlines())[:300]
+            failures.append(f"trade={tid} {detail}")
+            print(f"Close refused: trade={tid} {detail}",file=sys.stderr)
             continue
         finalize_execution(tid,result)
         print(f"Close result trade={tid} method={method} filled={getattr(result,'filled_qty',0)} remaining={getattr(result,'remaining_qty',qty)} stop_reason={getattr(result,'stop_reason','')}")
@@ -1742,13 +1756,13 @@ def run_trade_workflow():
     except Exception as exc: raise OperationalFailure(f"Unable to fetch broker market clock: {redact(exc)}") from exc
     if not bool(getattr(clock,"is_open",False)):
         print(f"Market closed; neutral skip. Next open: {getattr(clock,'next_open','unknown')}"); return 0
-    # A close stuck on invalid quotes is reported after entries rather than
-    # blocking them; the stuck position still counts toward the exposure cap.
+    # A close stuck on invalid quotes or refused is reported after entries rather
+    # than blocking them; the stuck position still counts toward the exposure cap.
     close_failures=close_due_trades(client,reconciliation,run_deadline,getattr(clock,"next_close",None))
     open_new_positions(client,clock,run_deadline)
     if close_failures:
         raise OperationalFailure(
-            f"{len(close_failures)} due trade close(s) remain unresolved after quote validation retries: "
+            f"{len(close_failures)} due trade close(s) remain unresolved: "
             + "; ".join(close_failures)
         )
     return 0
