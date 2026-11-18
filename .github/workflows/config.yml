@@ -2,6 +2,9 @@ name: Earnings Trade Automation
 
 on:
   schedule:
+    # Early retries leave room for GitHub's scheduled-run delays.
+    - cron: '37 2,5,8,11 * * 1-5'
+      timezone: 'America/New_York'
     - cron: '40 9 * * 1-5'
       timezone: 'America/New_York'
     - cron: '45 14 * * 1-5'
@@ -59,6 +62,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          # A queued run needs the ledger committed by the preceding run.
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: true
 
