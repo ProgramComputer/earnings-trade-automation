@@ -497,7 +497,7 @@ class ReleaseUnfilledOpenPlanTests(unittest.TestCase):
 
 
 class CloseFailureOrderingTests(unittest.TestCase):
-    def test_unresolved_close_is_reported_after_new_entries_run(self):
+    def test_a_broker_refusal_is_reported_after_new_entries_run(self):
         client = Mock()
         client.get_clock.return_value = SimpleNamespace(is_open=True)
         calls = []
@@ -510,7 +510,7 @@ class CloseFailureOrderingTests(unittest.TestCase):
             patch.object(
                 trade_workflow,
                 "close_due_trades",
-                side_effect=lambda *_args: calls.append("close") or ["trade=stuck CLOSE_QUOTE_VALIDATION_FAILED"],
+                side_effect=lambda *_args: calls.append("close") or ["trade=stuck broker refusal"],
             ),
             patch.object(
                 trade_workflow,
@@ -521,6 +521,48 @@ class CloseFailureOrderingTests(unittest.TestCase):
             with self.assertRaisesRegex(trade_workflow.OperationalFailure, "1 due trade close"):
                 trade_workflow.run_trade_workflow()
         self.assertEqual(calls, ["close", "open"])
+
+    def test_an_untradeable_long_call_quote_warns_without_failing_the_run(self):
+        client = Mock()
+        client.get_clock.return_value = SimpleNamespace(is_open=True)
+        trade = {
+            "trade_id": "trade-ABR", "Ticker": "ABR", "Open Date": "2026-10-29",
+            "When": "AMC", "earnings_date": "2026-10-29", "remaining_quantity": 34,
+            "Short Symbol": "ABR261106C00003000", "Long Symbol": "ABR261204C00003000",
+        }
+        error = alpaca_integration.QuoteValidationError("Quote for ABR261204C00003000 has zero bid_size.")
+        output = io.StringIO()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        summary_path = Path(directory.name) / "summary.md"
+        with (
+            patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary_path)}),
+            patch.object(trade_workflow, "configured_mode"),
+            patch.object(trade_workflow, "init_db"),
+            patch.object(trade_workflow, "configured_broker_client", return_value=(client, "PAPER")),
+            patch.object(trade_workflow, "bind_or_validate_broker_identity"),
+            patch.object(trade_workflow, "reconcile_broker_state", return_value={
+                "resolutions": {"trade-ABR": "SHORT_EXPIRED_LONG_REMAINS"},
+            }),
+            patch.object(trade_workflow, "get_open_trades", return_value=[trade]),
+            patch.object(trade_workflow, "is_time_to_close", return_value=True),
+            patch.object(trade_workflow, "account_snapshot"),
+            patch.object(trade_workflow, "reserve_operation_prefix", return_value="prefix"),
+            patch.object(trade_workflow, "close_single_option_leg_order", side_effect=error),
+            patch.object(trade_workflow, "record_close_quote_failure", return_value=f"CLOSE_QUOTE_VALIDATION_FAILED: {error}") as recorded,
+            patch.object(trade_workflow, "finalize_execution") as finalize,
+            patch.object(trade_workflow, "open_new_positions") as entries,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(trade_workflow.main([]), 0)
+            summary = summary_path.read_text(encoding="utf-8")
+        recorded.assert_called_once_with("trade-ABR", error)
+        finalize.assert_not_called()
+        entries.assert_called_once()
+        self.assertEqual(trade["remaining_quantity"], 34)
+        self.assertIn("::warning title=Due close deferred::trade=trade-ABR", output.getvalue())
+        self.assertIn("zero bid_size", output.getvalue())
+        self.assertIn("- Overdue exits: 1 (ABR trade-ABR)", summary)
 
 
 def volume_history(symbols_and_volumes):
@@ -1158,7 +1200,7 @@ class CloseQuoteAgeTests(unittest.TestCase):
         return data
 
     def close_phm(self, short_age, **settings):
-        """Run PHM's due close against real quote checks; return (failures, limits sent)."""
+        """Run PHM's due close against real quote checks; return failures, limits and logs."""
         trade = {
             "trade_id": "trade-PHM", "Ticker": "PHM", "Open Date": "2026-10-21", "When": "BMO",
             "earnings_date": "2026-10-22", "remaining_quantity": 5, "Short Symbol": self.SHORT, "Long Symbol": self.LONG,
@@ -1167,6 +1209,7 @@ class CloseQuoteAgeTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         client.get_clock.return_value = SimpleNamespace(is_open=True, timestamp=now, next_close=now + timedelta(hours=2))
         sent = []
+        output = io.StringIO()
 
         def submit(_client, request, _client_order_id):
             sent.append(Decimal(str(request.limit_price)))
@@ -1196,26 +1239,28 @@ class CloseQuoteAgeTests(unittest.TestCase):
             ):
                 stack.enter_context(patch.object(trade_workflow, name, value))
             stack.enter_context(patch.object(trade_workflow.time_module, "monotonic", return_value=0))
-            stack.enter_context(redirect_stdout(io.StringIO()))
+            stack.enter_context(redirect_stdout(output))
             stack.enter_context(patch("sys.stderr", io.StringIO()))
             failures = trade_workflow.close_due_trades(object(), {"resolutions": {"trade-PHM": "MATCHED_SPREAD"}}, 10_000)
-        return failures, sent
+        return failures, sent, output.getvalue()
 
     def test_a_due_close_prices_from_a_quote_minutes_old(self):
-        failures, sent = self.close_phm(620)
+        failures, sent, _ = self.close_phm(620)
         self.assertEqual(failures, [])
         self.assertEqual(sent, [Decimal("-3.10")])
 
-    def test_a_quote_older_than_the_close_limit_still_fails_the_close(self):
-        failures, sent = self.close_phm(1000)
+    def test_a_quote_older_than_the_close_limit_defers_without_an_order(self):
+        failures, sent, output = self.close_phm(1000)
         self.assertEqual(sent, [])
-        self.assertEqual(len(failures), 1)
-        self.assertIn("Stale quote for PHM261023C00115000", failures[0])
-        self.assertIn("allowed=900s", failures[0])
+        self.assertEqual(failures, [])
+        self.assertIn("Stale quote for PHM261023C00115000", output)
+        self.assertIn("allowed=900s", output)
 
     def test_cloners_can_set_the_close_limit(self):
-        failures, _ = self.close_phm(620, CLOSE_QUOTE_MAX_AGE_SECONDS=300)
-        self.assertIn("allowed=300s", failures[0])
+        failures, sent, output = self.close_phm(620, CLOSE_QUOTE_MAX_AGE_SECONDS=300)
+        self.assertEqual(failures, [])
+        self.assertEqual(sent, [])
+        self.assertIn("allowed=300s", output)
         workflow = (Path(__file__).resolve().parent / ".github" / "workflows" / "config.yml").read_text(encoding="utf-8")
         self.assertIn("CLOSE_QUOTE_MAX_AGE_SECONDS: ${{ vars.CLOSE_QUOTE_MAX_AGE_SECONDS }}", workflow)
 

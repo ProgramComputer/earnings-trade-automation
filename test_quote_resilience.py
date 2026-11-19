@@ -209,6 +209,7 @@ class CloseIsolationTests(unittest.TestCase):
         self.assertTrue(stored[1])
 
     def test_one_bad_quote_does_not_block_later_due_trade_management(self):
+        output = io.StringIO()
         failed_trade = {
             "trade_id": "trade-bad",
             "Open Date": "2026-08-31",
@@ -266,13 +267,13 @@ class CloseIsolationTests(unittest.TestCase):
                 return_value="CLOSE_QUOTE_VALIDATION_FAILED: still stale",
             ) as record_failure,
             patch.object(trade_workflow, "finalize_execution") as finalize,
+            redirect_stdout(output),
         ):
             failures = trade_workflow.close_due_trades(object(), resolution, 10_000)
 
-        self.assertEqual(
-            failures,
-            ["trade=trade-bad CLOSE_QUOTE_VALIDATION_FAILED: still stale"],
-        )
+        self.assertEqual(failures, [])
+        self.assertIn("::warning title=Due close deferred::trade=trade-bad", output.getvalue())
+        self.assertIn("CLOSE_QUOTE_VALIDATION_FAILED: still stale; the next run retries it.", output.getvalue())
         self.assertEqual(close_order.call_count, 2)
         record_failure.assert_called_once()
         self.assertEqual(record_failure.call_args.args[0], "trade-bad")

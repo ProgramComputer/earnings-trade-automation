@@ -1495,7 +1495,7 @@ def weekdays_until(day,expiry):
 
 
 def close_due_trades(client,reconciliation,run_deadline,market_close=None):
-    """Close due positions and return the ones that stayed open on bad quotes or a refusal."""
+    """Defer closes with unsafe quotes and return broker refusals after trying the rest."""
     failures=[]
     due=[]
     for trade in get_open_trades():
@@ -1563,8 +1563,7 @@ def close_due_trades(client,reconciliation,run_deadline,market_close=None):
             else: raise ReconciliationFailure(f"Trade {tid} has no safe close path")
         except QuoteValidationError as exc:
             status=record_close_quote_failure(tid,exc)
-            failures.append(f"trade={tid} {status}")
-            print(f"Close unresolved after bounded quote retries: trade={tid} {status}",file=sys.stderr)
+            print(f"::warning title=Due close deferred::trade={tid} {status}; the next run retries it.")
             continue
         except (InsufficientBuyingPower,APIError) as exc:
             # One close the account can't pay for, or that Alpaca rejects, must
@@ -1756,8 +1755,8 @@ def run_trade_workflow():
     except Exception as exc: raise OperationalFailure(f"Unable to fetch broker market clock: {redact(exc)}") from exc
     if not bool(getattr(clock,"is_open",False)):
         print(f"Market closed; neutral skip. Next open: {getattr(clock,'next_open','unknown')}"); return 0
-    # A close stuck on invalid quotes or refused is reported after entries rather
-    # than blocking them; the stuck position still counts toward the exposure cap.
+    # Unsafe quotes defer a close; broker refusals still fail after entries.
+    # Every remaining position still counts toward the exposure cap.
     close_failures=close_due_trades(client,reconciliation,run_deadline,getattr(clock,"next_close",None))
     open_new_positions(client,clock,run_deadline)
     if close_failures:
